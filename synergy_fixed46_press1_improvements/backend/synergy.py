@@ -26,7 +26,6 @@ for _d in [BASE_DIR, PROFILES_D, AUDIO_D]:
     os.makedirs(_d, exist_ok=True)
 
 DEFAULT_SETTINGS = {
-
     "accounts":              [{"email": "", "password": "", "profile": "profile_1"}],
     "telegram_bot_token":    "",
     "telegram_user_id":      "",
@@ -81,9 +80,6 @@ def log_msg(msg, level="info"):
     if len(state["log"]) > 500:
         state["log"] = state["log"][-500:]
     logging.info(msg)
-    # GUI always receives every log entry above.
-    # Telegram only receives errors when verbose_debug is OFF.
-    # DTMF press alerts go via tg_notify_dtmf() directly — never filtered.
     if level == "error" and not settings.get("verbose_debug", False):
         tg_notify(f"\u26a0\ufe0f ERROR\n{msg}")
 
@@ -91,13 +87,12 @@ def debug_msg(msg):
     if settings.get("verbose_debug", False):
         log_msg(f"[debug] {msg}", "info")
 
-# Persistent session for Telegram — avoids "connection pool full" spam during DTMF bursts
+# Persistent session for Telegram
 import requests as _tg_req
 _tg_session = _tg_req.Session()
 _tg_session.mount("https://", _tg_req.adapters.HTTPAdapter(pool_connections=2, pool_maxsize=8))
 
 def tg_notify(msg):
-    """Send to Telegram — called only for errors (verbose_debug OFF) from log_msg."""
     token = settings.get("telegram_bot_token", "")
     uid   = settings.get("telegram_user_id", 0)
     if not token or not uid:
@@ -111,7 +106,6 @@ def tg_notify(msg):
         pass
 
 def tg_notify_dtmf(number, key, account_email):
-    """Dedicated DTMF alert — ALWAYS sends to Telegram regardless of verbose_debug."""
     token = settings.get("telegram_bot_token", "")
     uid   = settings.get("telegram_user_id", 0)
     if not token or not uid:
@@ -230,7 +224,6 @@ def play_audio_in_tab(driver, filepath, block=True, dtmf_interrupt=False,
                     log_msg(f"[audio][dtmf] Thread saw key '{cur}' during prompt", "info")
                     return
             except Exception:
-                # Keep trying — transient JS errors are ignored
                 pass
             time.sleep(0.15)
 
@@ -245,7 +238,6 @@ def play_audio_in_tab(driver, filepath, block=True, dtmf_interrupt=False,
         driver.execute_script("window._gvAudioDone = false; window._gvAudioPlaying = false;")
 
         if dtmf_interrupt:
-            # Reset DTMF state only once at the start of this prompt
             driver.execute_script("""
                 window._gvDTMF = window._gvDTMF || {};
                 window._gvDTMF.detected   = null;
@@ -268,7 +260,6 @@ def play_audio_in_tab(driver, filepath, block=True, dtmf_interrupt=False,
                 except Exception:
                     pass
 
-                # DTMF hit while audio still playing
                 if dtmf_interrupt and dtmf_event.is_set():
                     detected_key = dtmf_result[0]
                     log_msg(f"[audio][dtmf] Interrupting prompt for key '{detected_key}'", "success")
@@ -352,8 +343,6 @@ def make_options(profile_name, headless=False):
     profile_path = os.path.join(PROFILES_D, profile_name)
     os.makedirs(profile_path, exist_ok=True)
 
-    # Remove stale lock files that can block Chromium from reopening the same
-    # persistent profile directory after an unclean shutdown.
     for _stale in ["SingletonLock", "SingletonCookie", "SingletonSocket", "DevToolsActivePort"]:
         _sp = os.path.join(profile_path, _stale)
         try:
@@ -411,9 +400,6 @@ def make_options(profile_name, headless=False):
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Web Audio + DTMF hook (injected via CDP on every new document)
-# Uses a single AudioContext per tab shared between:
-#   1. Energy/burst analyser  → VM / screening classification
-#   2. FFT DTMF analyser      → tone frequency detection (no pyaudio needed)
 # ─────────────────────────────────────────────────────────────────────────────
 _WEBAUDIO_HOOK = r"""
 (function() {
@@ -457,11 +443,11 @@ _WEBAUDIO_HOOK = r"""
   ];
   var SR       = 16000;
   var FFTSIZE  = 2048;
-  var BIN_HZ   = SR / FFTSIZE;           // 7.8125 Hz per bin
-  var THRESH   = 0.008;                  // energy threshold (burst/vm)
-  var DTMF_DB  = 55;                     // min dB for DTMF tone (0-255 scale → ~85)
-  var DTMF_THR = Math.round(DTMF_DB / 100 * 255);  // ≈ 140
-  var DEBOUNCE = 300;                    // ms between same-key detections
+  var BIN_HZ   = SR / FFTSIZE;
+  var THRESH   = 0.008;
+  var DTMF_DB  = 55;
+  var DTMF_THR = Math.round(DTMF_DB / 100 * 255);
+  var DEBOUNCE = 300;
 
   function freqToBin(f) { return Math.round(f / BIN_HZ); }
   var rowBins = ROW_FREQS.map(freqToBin);
@@ -502,14 +488,13 @@ _WEBAUDIO_HOOK = r"""
 
       /* — DTMF FFT analyser — */
       var dtAn = ctx.createAnalyser(); dtAn.fftSize = FFTSIZE;
-      var dtBuf = new Uint8Array(dtAn.frequencyBinCount);  // 1024 bins
+      var dtBuf = new Uint8Array(dtAn.frequencyBinCount);
       src.connect(dtAn);
 
       setInterval(function() {
         if (!window._gvDTMF.listening) return;
         dtAn.getByteFrequencyData(dtBuf);
 
-        /* find strongest row and column bins */
         var bestRow = -1, bestRowVal = 0;
         for (var r = 0; r < rowBins.length; r++) {
           var v = dtBuf[rowBins[r]];
@@ -523,8 +508,6 @@ _WEBAUDIO_HOOK = r"""
 
         if (bestRowVal < DTMF_THR || bestColVal < DTMF_THR) return;
 
-        /* require the row/col peaks to be clearly dominant
-           (no other row/col bin within 75% of the winner) */
         var rowOk = true, colOk = true;
         for (var r2 = 0; r2 < rowBins.length; r2++) {
           if (r2 !== bestRow && dtBuf[rowBins[r2]] > bestRowVal * 0.75) { rowOk = false; break; }
@@ -705,52 +688,7 @@ def _inject_audio_hook(driver):
         log_msg(f"[audio hook] CDP inject failed (non-fatal): {e}", "warning")
 
 # ── Driver helpers ────────────────────────────────────────────────────────────
-def _make_driver_opts(profile_name, headless=False):
-    opts = Options()
-    profile_path = os.path.join(PROFILES_D, profile_name)
-    os.makedirs(profile_path, exist_ok=True)
-    # Remove stale lock files that cause DevToolsActivePort crashes
-    for _stale in ["SingletonLock", "SingletonCookie", "SingletonSocket", "DevToolsActivePort"]:
-        _sp = os.path.join(profile_path, _stale)
-        try:
-            if os.path.exists(_sp):
-                os.remove(_sp)
-        except Exception:
-            pass
-    opts.add_argument(f"--user-data-dir={profile_path}")
-    if headless:
-        opts.add_argument("--headless=new")
-    # Always add --disable-gpu on Windows for Chromium stability
-    opts.add_argument("--disable-gpu")
-    opts.add_argument("--no-sandbox")
-    opts.add_argument("--disable-dev-shm-usage")
-    opts.add_argument("--disable-extensions")
-    opts.add_argument("--disable-client-side-phishing-detection")
-    opts.add_argument("--disable-hang-monitor")
-    opts.add_argument("--disable-translate")
-    opts.add_argument("--metrics-recording-only")
-    opts.add_argument("--password-store=basic")
-    opts.add_argument("--disable-component-update")
-    opts.add_argument("--remote-debugging-port=0")
-    opts.add_argument("--disable-background-networking")
-    opts.add_argument("--disable-renderer-backgrounding")
-    opts.add_argument("--disable-background-timer-throttling")
-    opts.add_argument("--disable-popup-blocking")
-    # combined into new flags below
-    opts.add_argument("--use-fake-ui-for-media-stream")
-    opts.add_argument("--disable-blink-features=AutomationControlled")
-    opts.add_argument("--no-first-run")
-    opts.add_argument("--no-default-browser-check")
-    opts.add_argument("--disable-default-apps")
-    opts.add_argument("--disable-sync")
-    opts.add_argument("--disable-features=Translate,OptimizationHints,MediaRouter,ChromeWhatsNewUI,PrivacySandboxSettings4")
-    opts.add_argument("--suppress-message-center-popups")
-    opts.add_experimental_option("excludeSwitches", ["enable-automation"])
-    opts.add_experimental_option("useAutomationExtension", False)
-    chromium = _find_chromium()
-    if chromium:
-        opts.binary_location = chromium
-    return opts
+# FIX #43: _make_driver_opts() was dead code duplicating make_options() — deleted.
 
 def get_driver(profile_name, headless=False):
     opts = make_options(profile_name, headless=headless)
@@ -777,6 +715,10 @@ def get_driver(profile_name, headless=False):
 
 
 def gv_login(driver, account):
+    """Navigate to GV login page and auto-fill credentials.
+    FIX #20: Stop navigating away from GV mid-auth once login page is confirmed loaded.
+    The polling loop no longer calls driver.get() — it only reads the current URL.
+    """
     login_url = (
         "https://accounts.google.com/signin/v2/identifier?continue="
         "https%3A%2F%2Fvoice.google.com%2F&service=grandcentral&flowName=GlifWebSignIn&flowEntry=ServiceLogin"
@@ -855,14 +797,15 @@ def gv_login(driver, account):
         log_msg(f"Auto-login error: {e} — complete manually", "warning")
 
     log_msg(f"Waiting for login: {account['email']} — complete 2FA in the browser", "warning")
+    # FIX #20: Poll current_url only — do NOT call driver.get() here.
+    # Navigating away mid-auth breaks Google's OAuth flow.
     for _ in range(120):
         try:
-            driver.get("https://voice.google.com")
-            time.sleep(1)
-            if "challenge" in driver.current_url:
+            cur = driver.current_url
+            if "challenge" in cur:
                 log_msg(f"Google login challenge for {account['email']} — complete manually once; session will persist after that", "warning")
-                return False
-            if "voice.google.com" in driver.current_url and "accounts.google.com" not in driver.current_url:
+                # Keep polling — don't return False, let user complete challenge
+            elif "voice.google.com" in cur and "accounts.google.com" not in cur:
                 log_msg(f"Login successful: {account['email']}", "success")
                 return True
         except Exception:
@@ -875,32 +818,17 @@ _drivers = {}
 drivers = _drivers
 
 
-
 def _is_driver_alive(driver):
     try: _ = driver.current_url; return True
     except Exception: return False
 
 
-
 def is_driver_alive(driver):
     return _is_driver_alive(driver)
 
-def _profile_name_for(account):
-    explicit = account.get("profile", "").strip()
-    if explicit and explicit not in ("profile_1", ""):
-        return explicit
-    name = re.sub(r"[^a-zA-Z0-9_]", "_",
-                  account.get("email", "default").split("@")[0])
-    return f"gvbot_{name}"
-
-def profile_name(account):
-    explicit = account.get("profile", "").strip()
-    if explicit and explicit not in ("profile_1", "profile1", ""):
-        return explicit
-    import re as _re
-    name = _re.sub(r"[^a-zA-Z0-9]", "", account.get("email", "default").split("@")[0])
-    return f"gvbot_{name}"
-
+# FIX #5/#44: Deleted _profile_name_for() and profile_name() — both were divergent
+# duplicates with subtly different stripping logic, causing driver key mismatches.
+# Use profile_name_for_account() everywhere.
 
 def profile_name_for_account(account):
     explicit = account.get("profile", "").strip()
@@ -909,7 +837,6 @@ def profile_name_for_account(account):
     import re as _re2
     name = _re2.sub(r"[^a-zA-Z0-9]", "", account.get("email", "default").split("@")[0])
     return f"gvbot_{name}"
-
 
 
 def safe_get(driver, url, retries=2):
@@ -1022,10 +949,9 @@ def _dom_has(driver, selectors):
         except Exception: pass
     return False
 
-
-
 def dom_has(driver, selectors):
     return _dom_has(driver, selectors)
+
 def _get_call_timer(driver):
     try:
         texts = driver.execute_script("""
@@ -1043,10 +969,9 @@ def _get_call_timer(driver):
     except Exception: pass
     return None
 
-
-
 def get_call_timer(driver):
     return _get_call_timer(driver)
+
 def _reset_classify(driver):
     try: driver.execute_script("if(window._gvStartClassify) window._gvStartClassify();")
     except Exception: pass
@@ -1104,7 +1029,6 @@ def _wait_for_pickup_and_classify(driver):
                 log_msg(f"[vm] Result: {result} "
                         f"(speech={cs.get('totalSpeechMs',0)}ms "
                         f"burst={cs.get('maxBurstMs',0)}ms)", "info")
-                # Time-based guard: long ring + screening -> voicemail
                 try:
                     ring_ms = getattr(driver, "_last_ring_ms", None)
                 except Exception:
@@ -1117,13 +1041,11 @@ def _wait_for_pickup_and_classify(driver):
             return _dom_classify(driver)
         time.sleep(0.15)
 
-# ── DTMF polling ──────────────────────────────────────────────────────────────
-
-
 def wait_for_pickup_and_classify(driver):
     return _wait_for_pickup_and_classify(driver)
+
+# ── DTMF polling ──────────────────────────────────────────────────────────────
 def _start_dtmf_listen(driver):
-    """Reset DTMF state and start listening."""
     try:
         driver.execute_script("if(window._gvStartDTMF) window._gvStartDTMF();")
     except Exception as e:
@@ -1137,10 +1059,12 @@ def _stop_dtmf_listen(driver):
 def _poll_for_dtmf(driver, timeout_s, number, account_email):
     """
     Poll for a DTMF keypress for up to timeout_s seconds.
-    Returns the key string ('1','2',etc.) or None on timeout.
-    Sends Telegram notification immediately on detection.
+    FIX #60: Only triggers on the configured dtmf_key_to_detect, not any key.
+    Returns the key string or None on timeout.
     """
-    log_msg(f"[dtmf] Listening for keypress ({timeout_s}s)...", "info")
+    # FIX #60: read the configured key to detect from live settings
+    key_to_detect = str(settings.get("dtmf_key_to_detect", "1")).strip()
+    log_msg(f"[dtmf] Listening for key '{key_to_detect}' ({timeout_s}s)...", "info")
     deadline = time.time() + timeout_s
     last_key  = None
     while time.time() < deadline:
@@ -1150,21 +1074,21 @@ def _poll_for_dtmf(driver, timeout_s, number, account_email):
             if dtmf and dtmf.get("detected") and dtmf["detected"] != last_key:
                 key = dtmf["detected"]
                 last_key = key
-                log_msg(f"[dtmf] Key '{key}' received from {number}!", "success")
-                tg_notify_dtmf(number, key, account_email)
-                return key
+                # FIX #60: filter — only act on the configured key
+                if key == key_to_detect:
+                    log_msg(f"[dtmf] Key '{key}' received from {number}!", "success")
+                    tg_notify_dtmf(number, key, account_email)
+                    return key
+                else:
+                    log_msg(f"[dtmf] Key '{key}' ignored (watching for '{key_to_detect}')", "info")
         except Exception: pass
         time.sleep(0.2)
-    log_msg(f"[dtmf] No keypress in {timeout_s}s from {number}", "info")
+    log_msg(f"[dtmf] No key '{key_to_detect}' in {timeout_s}s from {number}", "info")
     return None
 
 # ── make_call ─────────────────────────────────────────────────────────────────
-
-
 def _maybe_click_chromium_profile(driver):
-    """Dismiss Chromium first-run 'Make Chromium your own' profile dialog if present."""
     try:
-        # Try common text/button selectors for the profile card
         js = """
           var btn = Array.from(document.querySelectorAll('button, div'))
             .find(el => /continue as/i.test(el.textContent||''));
@@ -1197,8 +1121,8 @@ def make_call(driver, number, _account=None, _retry=False):
         time.sleep(1)
         driver.execute_script(_GV_DIAL_JS, number)
         log_msg(f"[call] Dialing {number}...", "info")
-        # start measuring ring duration
-        ring_start = time.time()
+        # FIX #58: ring_start set only AFTER _gvDialResult == true is confirmed
+        ring_start = None
         for _ in range(60):
             result = driver.execute_script("return window._gvDialResult;")
             err    = driver.execute_script("return window._gvDialError;")
@@ -1206,13 +1130,16 @@ def make_call(driver, number, _account=None, _retry=False):
                 debug = driver.execute_script("return window._gvDialDebug || [];")
                 if debug: log_msg(f"[call] Debug info: {debug[:10]}", "warning")
                 log_msg(f"[call] Dial error: {err} — {number}", "error"); return False
-            if result is True: break
+            if result is True:
+                # FIX #58: start ring timer now — call is confirmed connected
+                ring_start = time.time()
+                break
             time.sleep(0.2)
         else:
             log_msg(f"[call] Dial timed out: {number}", "error"); return False
         # store total ring time in ms on the driver so classifier can use it
         try:
-            driver._last_ring_ms = max(0, int((time.time() - ring_start) * 1000))
+            driver._last_ring_ms = max(0, int((time.time() - ring_start) * 1000)) if ring_start else None
         except Exception:
             driver._last_ring_ms = None
         call_type = _wait_for_pickup_and_classify(driver)
@@ -1236,7 +1163,6 @@ def hangup(driver):
 
 def _account_worker(account, num_queue, drivers, settings, lock):
     """Single-account worker — pulls numbers from shared queue and calls them."""
-    # FIX #24: acc_key must match key used in _drivers (global). Use profile_name_for_account.
     acc_key = profile_name_for_account(account)
     email   = account["email"]
 
@@ -1283,7 +1209,9 @@ def _account_worker(account, num_queue, drivers, settings, lock):
                 with lock: state["failed"] += 1
                 time.sleep(3); continue
 
-            # Screen call handling
+            # FIX #21: Screen call handling — only play audio if call is connected
+            # call_type will be "screening" only after make_call() returned True,
+            # which means _gvDialResult==true and pickup confirmed. Safe to play.
             sc_action = settings.get("screen_hangup_action", "hangup")
             if call_type == "screening" and screen_hangup:
                 if sc_action == "play_audio" and audio_screen_bypass:
@@ -1306,7 +1234,9 @@ def _account_worker(account, num_queue, drivers, settings, lock):
                 log_msg(f"[{email}] [audio] Playing initial message...", "info")
                 time.sleep(1)
                 if dtmf_enabled:
-                    # DTMF monitored DURING audio — cuts short if press1 detected
+                    # DTMF monitored DURING audio — cuts short if press1 detected.
+                    # FIX #25: play_audio_in_tab already plays press1_filepath internally
+                    # on DTMF interrupt. Do NOT play press1 again after this returns.
                     dtmf_key = play_audio_in_tab(
                         driver, audio_initial,
                         block=True,
@@ -1320,21 +1250,17 @@ def _account_worker(account, num_queue, drivers, settings, lock):
                 else:
                     play_audio_in_tab(driver, audio_initial)
 
-            # Fast-path: if DTMF was already caught mid-audio, skip the extra sleep and
-            # post-audio DTMF listen window. But do NOT preempt the press1 path — the
-            # guarded play_audio_in_tab() already honors press1_filepath before returning.
+            # FIX #25: If dtmf_key was caught mid-audio, press1 was ALREADY played
+            # inside play_audio_in_tab() via press1_filepath. Do not play it again here.
             if dtmf_key:
-                if audio_press1:
-                    log_msg(f"[{email}] DTMF mid-audio confirmed — press1 already honored, hanging up now", "info")
-                else:
-                    log_msg(f"[{email}] DTMF mid-audio confirmed — no press1 configured, hanging up immediately", "info")
+                log_msg(f"[{email}] DTMF mid-audio confirmed — press1 already honored, hanging up now", "info")
             elif dtmf_enabled:
                 time.sleep(0.3)
-                # No key caught during audio — open normal post-audio listen window
                 log_msg(f"[{email}] [dtmf] Post-audio listen window {dtmf_timeout}s...", "info")
                 _start_dtmf_listen(driver)
                 dtmf_key = _poll_for_dtmf(driver, dtmf_timeout, num, email)
                 _stop_dtmf_listen(driver)
+                # FIX #25: Only play press1 here if caught in POST-audio window (not mid-audio)
                 if dtmf_key and audio_press1:
                     play_audio_in_tab(driver, audio_press1, block=True)
             elif not audio_initial:
@@ -1363,7 +1289,7 @@ def campaign_worker():
     if not accounts:
         log_msg("No accounts configured.", "error"); state["running"] = False; return
 
-    numbers = list(state["numbers"])  # snapshot — safe against UI changes mid-run
+    numbers = list(state["numbers"])
     if not numbers:
         log_msg("No numbers queued.", "error"); state["running"] = False; return
 
@@ -1372,9 +1298,6 @@ def campaign_worker():
 
     log_msg(f"Campaign starting — {len(numbers)} numbers, {concurrent} concurrent account(s)", "info")
 
-    # ── Pre-flight: init browsers ─────────────────────────────────────────────
-    # FIX #24: Do NOT create a local `drivers` dict that shadows _drivers.
-    # Populate _drivers directly so _account_worker receives the global registry.
     for acc in active_accs:
         key = profile_name_for_account(acc)
         log_msg(f"[preflight] Initializing {acc['email']}...", "info")
@@ -1390,7 +1313,6 @@ def campaign_worker():
         state["running"] = False; return
     log_msg(f"[preflight] {len(ready)}/{concurrent} accounts ready — launching workers", "success")
 
-    # ── Shared number queue ───────────────────────────────────────────────────
     import queue as _queue
     num_q = _queue.Queue()
     for n in numbers:
@@ -1400,7 +1322,6 @@ def campaign_worker():
     workers = []
     for acc in ready:
         t = threading.Thread(target=_account_worker,
-                             # FIX #24: pass global _drivers, not a local copy
                              args=(acc, num_q, _drivers, settings, lock),
                              daemon=True)
         t.start()
@@ -1443,7 +1364,6 @@ def login_profile(profile):
 
     def _do_login():
         try:
-            # FIX #56: lock around login_status write
             with _login_status_lock:
                 state["login_status"][key] = "pending"
             log_msg(f"[login] Starting auto-login for {email} using profile: {profile_path}", "info")
@@ -1457,7 +1377,6 @@ def login_profile(profile):
                 state["login_status"][key] = "failed"
             log_msg(f"[login] {email} failed using profile {profile_path}: {e}", "error")
 
-    # FIX #56: lock around login_status write in route thread
     with _login_status_lock:
         state["login_status"][key] = "pending"
     threading.Thread(target=_do_login, daemon=True).start()
@@ -1469,7 +1388,6 @@ def login_profile(profile):
 
 @flask_app.route("/api/state")
 def api_state():
-    # FIX #56: lock around login_status read
     with _login_status_lock:
         login_status_snapshot = dict(state["login_status"])
     s = {**state, "log": state["log"][-60:], "login_status": login_status_snapshot}
@@ -1575,12 +1493,14 @@ def api_test_call():
                 call_type = getattr(d, "_last_call_type", "unknown")
                 audio_bypass = s.get("audio_screen_bypass", "")
                 audio_initial = s.get("audio_initial", "")
+                # FIX #42: Only play screening audio if call is confirmed connected (ok==True)
                 if call_type == "screening" and s.get("screen_hangup_enabled") and s.get("screen_hangup_action") == "play_audio" and audio_bypass:
                     log_msg(f"[test] Screen call detected — playing BYPASS audio: {number}", "warning")
                     play_audio_in_tab(d, audio_bypass)
                 key = None
                 if audio_initial:
                     if s.get("dtmf_enabled"):
+                        # FIX #25: press1 plays inside play_audio_in_tab on interrupt — not again below
                         key = play_audio_in_tab(
                             d, audio_initial,
                             block=True,
@@ -1590,15 +1510,14 @@ def api_test_call():
                             account_email=account["email"]
                         )
                     else:
-                        play_audio_in_tab(d, audio_initial)  # blocks until done
+                        play_audio_in_tab(d, audio_initial)
                 if s.get("dtmf_enabled") and not key:
                     _start_dtmf_listen(d)
                     key = _poll_for_dtmf(d, int(s.get("dtmf_timeout", 20)), number, account["email"])
                     _stop_dtmf_listen(d)
+                    # Only play press1 here for post-audio window catch
                     if key and s.get("audio_press1"):
                         play_audio_in_tab(d, s["audio_press1"])
-                else:
-                    time.sleep(s.get("delay_between_calls", 45))
                 hang_up(d)
             log_msg(f"Test call to {number} complete", "success")
         except Exception as e:
@@ -1609,8 +1528,6 @@ def api_test_call():
 
 @flask_app.route("/api/audio/play", methods=["POST"])
 def api_audio_play():
-    """Flask-controlled JS audio injection endpoint.
-    Finds the driver for the given account key and injects audio into that tab only."""
     data = request.json or {}
     filepath  = data.get("filepath", "")
     acct_key  = data.get("account_key", "")
@@ -1621,7 +1538,6 @@ def api_audio_play():
     if not os.path.exists(filepath):
         return jsonify({"message": f"File not found: {filepath}"}), 404
 
-    # Resolve driver — by account_key or fall back to first available
     driver = _drivers.get(acct_key) if acct_key else None
     if driver is None and _drivers:
         driver = next(iter(_drivers.values()))
@@ -1642,7 +1558,6 @@ def api_audio_play():
 
 @flask_app.route("/api/audio/status", methods=["GET"])
 def api_audio_status():
-    """Returns playback status for a given account_key."""
     acct_key = request.args.get("account_key", "")
     driver = _drivers.get(acct_key) if acct_key else None
     if driver is None and _drivers:
@@ -1659,7 +1574,6 @@ def api_audio_status():
 
 @flask_app.route("/api/kill_browsers", methods=["POST"])
 def api_kill_browsers():
-    """Force-kill ALL Chromium and chromedriver processes system-wide, then clear driver registry."""
     killed = []
     targets = ["chromium", "chromium-browser", "chrome", "chromedriver"]
     try:
@@ -1679,7 +1593,6 @@ def api_kill_browsers():
     except Exception as e:
         log_msg(f"[kill] Error during force-kill: {e}", "error")
 
-    # Also cleanly quit tracked drivers and clear registry
     for d in list(_drivers.values()):
         try: d.quit()
         except Exception: pass
