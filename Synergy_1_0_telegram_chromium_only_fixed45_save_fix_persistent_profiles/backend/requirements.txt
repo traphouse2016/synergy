@@ -1,0 +1,7 @@
+flask
+flask-cors
+selenium
+webdriver-manager
+requests
+
+python-telegram-bot

@@ -1,0 +1,9 @@
+{
+  "name": "synergy-dialer",
+  "version": "1.0.0",
+  "main": "main.js",
+  "dependencies": {
+    "electron": "^29.0.0"
+  },
+  "productName": "Synergy 1.0"
+}
