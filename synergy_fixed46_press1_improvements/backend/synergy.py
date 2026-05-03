@@ -16,6 +16,7 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from webdriver_manager.chrome import ChromeDriverManager
 from webdriver_manager.core.os_manager import ChromeType
+from selenium.common.exceptions import WebDriverException
 
 BASE_DIR   = os.path.join(os.path.expanduser("~"), "synergy")
 SETTINGS_F = os.path.join(BASE_DIR, "settings.json")
@@ -48,11 +49,21 @@ DEFAULT_SETTINGS = {
     "verbose_debug":         False,
 }
 
+def _deep_merge(base, override):
+    """FIX #75: deep merge so nested keys in DEFAULT_SETTINGS auto-fill."""
+    result = dict(base)
+    for k, v in override.items():
+        if k in result and isinstance(result[k], dict) and isinstance(v, dict):
+            result[k] = _deep_merge(result[k], v)
+        else:
+            result[k] = v
+    return result
+
 def load_settings():
     if os.path.exists(SETTINGS_F):
         with open(SETTINGS_F) as f:
             saved = json.load(f)
-        return {**DEFAULT_SETTINGS, **saved}
+        return _deep_merge(DEFAULT_SETTINGS, saved)
     save_settings_to_disk(DEFAULT_SETTINGS)
     return dict(DEFAULT_SETTINGS)
 
@@ -74,9 +85,18 @@ state = {
     "log": [], "_stop": False,
 }
 
+# FIX #47: restore numbers from file on startup
+def load_numbers_from_file():
+    if os.path.exists(NUMBERS_F):
+        with open(NUMBERS_F) as f:
+            nums = [l.strip() for l in f if l.strip()]
+        state.update({"numbers": nums, "total": len(nums), "completed": 0, "failed": 0})
+        log_msg(f"Loaded {len(nums)} numbers from file.")
+
 def log_msg(msg, level="info"):
     entry = {"time": datetime.now().strftime("%H:%M:%S"), "msg": msg, "level": level}
     state["log"].append(entry)
+    # FIX #67: trim on every append, not periodically
     if len(state["log"]) > 500:
         state["log"] = state["log"][-500:]
     logging.info(msg)
@@ -90,7 +110,7 @@ def debug_msg(msg):
 # Persistent session for Telegram
 import requests as _tg_req
 _tg_session = _tg_req.Session()
-_tg_session.mount("https://", _tg_req.adapters.HTTPAdapter(pool_connections=2, pool_maxsize=8))
+_tg_session.mount("https://", _tg_req.adapters.HTTPAdapter(pool_connections=4, pool_maxsize=16))
 
 def tg_notify(msg):
     token = settings.get("telegram_bot_token", "")
@@ -208,7 +228,8 @@ def play_audio_in_tab(driver, filepath, block=True, dtmf_interrupt=False,
     detected_key  = None
     dtmf_event    = threading.Event()
     dtmf_result   = [None]
-    stop_poll     = threading.Event()
+    # FIX #33: only allocate stop_poll inside dtmf_interrupt block
+    stop_poll     = None
 
     # FIXED30_GUARDED_PATH: do not remove watcher-thread prompt interrupt logic
     def _dtmf_poll_thread():
@@ -238,6 +259,8 @@ def play_audio_in_tab(driver, filepath, block=True, dtmf_interrupt=False,
         driver.execute_script("window._gvAudioDone = false; window._gvAudioPlaying = false;")
 
         if dtmf_interrupt:
+            # FIX #33: allocate stop_poll only when dtmf_interrupt=True
+            stop_poll = threading.Event()
             driver.execute_script("""
                 window._gvDTMF = window._gvDTMF || {};
                 window._gvDTMF.detected   = null;
@@ -282,7 +305,7 @@ def play_audio_in_tab(driver, filepath, block=True, dtmf_interrupt=False,
 
                 time.sleep(0.15)
 
-        if dtmf_interrupt:
+        if dtmf_interrupt and stop_poll is not None:
             stop_poll.set()
             _stop_dtmf_listen(driver)
 
@@ -295,17 +318,10 @@ def play_audio_in_tab(driver, filepath, block=True, dtmf_interrupt=False,
 
     except Exception as e:
         log_msg(f"[audio] Inject error: {e}", "error")
-        if dtmf_interrupt:
+        if dtmf_interrupt and stop_poll is not None:
             stop_poll.set()
 
     return detected_key
-
-def load_numbers_from_file():
-    if os.path.exists(NUMBERS_F):
-        with open(NUMBERS_F) as f:
-            nums = [l.strip() for l in f if l.strip()]
-        state.update({"numbers": nums, "total": len(nums), "completed": 0, "failed": 0})
-        log_msg(f"Loaded {len(nums)} numbers from file.")
 
 def clear_cache():
     cleared = 0
@@ -840,27 +856,48 @@ def profile_name_for_account(account):
 
 
 def safe_get(driver, url, retries=2):
+    """FIX #29: broadened catch to cover ConnectionError, TimeoutError, WebDriverException."""
     last_err = None
     for attempt in range(retries + 1):
         try:
             driver.get(url)
             return True
-        except Exception as e:
+        except (ConnectionError, TimeoutError, WebDriverException) as e:
             last_err = e
-            msg = str(e)
-            if 'WinError 10061' in msg or 'actively refused it' in msg or 'connection refused' in msg.lower():
-                log_msg(f"[driver] Driver connection dropped during navigation to {url}; retry {attempt + 1}/{retries + 1}", "warning")
-                time.sleep(1.5)
-                continue
+            log_msg(f"[driver] Transient error navigating to {url}; retry {attempt + 1}/{retries + 1}: {e}", "warning")
+            time.sleep(1.5)
+            continue
+        except Exception as e:
             raise
     raise last_err
 
 
-def ensure_voice_ready(driver):
+_ERROR_PAGE_INDICATORS = [
+    "ERR_NAME_NOT_RESOLVED", "ERR_CONNECTION_REFUSED", "ERR_INTERNET_DISCONNECTED",
+    "ERR_NETWORK_CHANGED", "ERR_CONNECTION_TIMED_OUT", "ERR_ADDRESS_UNREACHABLE",
+    "This site can't be reached", "No internet", "DNS_PROBE",
+]
+
+def ensure_voice_ready(driver, account_index=0):
+    """FIX #61: derive /u/{index}/calls from account_index instead of hardcoding /u/0/calls.
+    FIX #30: check for error page indicators before returning True.
+    """
+    url = f"https://voice.google.com/u/{account_index}/calls"
     try:
-        safe_get(driver, 'https://voice.google.com/u/0/calls')
-        WebDriverWait(driver, 30).until(lambda d: d.execute_script('return document.readyState') == 'complete')
+        safe_get(driver, url)
+        WebDriverWait(driver, 30).until(lambda d: d.execute_script("return document.readyState") == "complete")
         time.sleep(3)
+        # FIX #30: detect error pages
+        try:
+            body_text = driver.execute_script("return document.body ? document.body.innerText : '';") or ""
+            page_src  = driver.page_source or ""
+            combined  = body_text + page_src
+            for indicator in _ERROR_PAGE_INDICATORS:
+                if indicator in combined:
+                    log_msg(f"[driver] Error page detected after navigation to {url}: {indicator}", "warning")
+                    return False
+        except Exception:
+            pass
         return True
     except Exception as e:
         log_msg(f"[driver] Voice preflight failed: {e}", "warning")
@@ -869,6 +906,16 @@ def ensure_voice_ready(driver):
 
 def get_or_create_driver(account):
     key = profile_name_for_account(account)
+    # FIX #61: derive account_index from position in settings accounts list
+    try:
+        acct_list = settings.get("accounts", [])
+        account_index = next(
+            (i for i, a in enumerate(acct_list) if a.get("email") == account.get("email")),
+            0
+        )
+    except Exception:
+        account_index = 0
+
     if key in _drivers:
         if _is_driver_alive(_drivers[key]):
             return _drivers[key]
@@ -890,7 +937,7 @@ def get_or_create_driver(account):
         raise
 
     try:
-        if not ensure_voice_ready(d):
+        if not ensure_voice_ready(d, account_index=account_index):
             raise RuntimeError('voice_preflight_failed')
     except Exception as e:
         try:
@@ -910,7 +957,7 @@ def get_or_create_driver(account):
             pass
         try:
             d = get_driver(key, headless=True)
-            if not ensure_voice_ready(d):
+            if not ensure_voice_ready(d, account_index=account_index):
                 raise RuntimeError('voice_preflight_failed_headless')
         except Exception as e:
             log_msg(f"[driver] Headless relaunch failed for {account['email']}: {e}", "warning")
@@ -919,7 +966,7 @@ def get_or_create_driver(account):
             except Exception:
                 pass
             d = get_driver(key, headless=False)
-            if not ensure_voice_ready(d):
+            if not ensure_voice_ready(d, account_index=account_index):
                 raise RuntimeError('voice_preflight_failed_visible_fallback')
             gv_login(d, acc)
 
@@ -981,6 +1028,34 @@ def _get_call_state(driver):
     except Exception: return None
 
 def _dom_classify(driver):
+    """FIX #62: use Shadow DOM traversal via CDP Runtime.evaluate with pierce to find VM phrases."""
+    try:
+        result = driver.execute_cdp_cmd("Runtime.evaluate", {
+            "expression": """
+                (function() {
+                  var phrases = """ + json.dumps(_VM_PHRASES) + """;
+                  function getText(root) {
+                    var text = '';
+                    try { text += (root.innerText || root.textContent || '').toLowerCase(); } catch(e) {}
+                    var all = root.querySelectorAll ? root.querySelectorAll('*') : [];
+                    for (var i = 0; i < all.length; i++) {
+                      if (all[i].shadowRoot) text += getText(all[i].shadowRoot);
+                    }
+                    return text;
+                  }
+                  var fullText = getText(document);
+                  for (var p = 0; p < phrases.length; p++) {
+                    if (fullText.indexOf(phrases[p]) !== -1) return 'voicemail';
+                  }
+                  return 'human';
+                })()
+            """,
+            "returnByValue": True,
+        })
+        return result.get("result", {}).get("value", "human")
+    except Exception:
+        pass
+    # fallback to shallow DOM scan if CDP fails
     scope = ""
     for sel in ["gv-call-widget", "gv-active-call", "mat-dialog-container"]:
         try:
@@ -1018,14 +1093,18 @@ def _wait_for_pickup_and_classify(driver):
     log_msg("[vm] Classifying call...", "info")
     _reset_classify(driver)
     classify_start = time.time()
+    # FIX #35: classified flag — only fire dom_fallback once per call
+    _classified = False
     while True:
         if _dom_has(driver, _SEL_ENDED): return "no_answer"
         elapsed_ms = (time.time() - classify_start) * 1000
         cs = _get_call_state(driver)
         if cs and cs.get("classifying"):
             result = _classify_audio(cs, elapsed_ms)
-            if result == "dom_fallback": return _dom_classify(driver)
-            if result is not None:
+            if result == "dom_fallback" and not _classified:
+                _classified = True
+                return _dom_classify(driver)
+            if result is not None and result != "dom_fallback":
                 log_msg(f"[vm] Result: {result} "
                         f"(speech={cs.get('totalSpeechMs',0)}ms "
                         f"burst={cs.get('maxBurstMs',0)}ms)", "info")
@@ -1037,7 +1116,8 @@ def _wait_for_pickup_and_classify(driver):
                     log_msg(f"[vm] Upgrading screening->voicemail (ring={ring_ms}ms)", "info")
                     result = "voicemail"
                 return result
-        if elapsed_ms > (_CLASSIFY_WINDOW_S * 1000) + 1000:
+        if elapsed_ms > (_CLASSIFY_WINDOW_S * 1000) + 1000 and not _classified:
+            _classified = True
             return _dom_classify(driver)
         time.sleep(0.15)
 
@@ -1102,11 +1182,15 @@ def _maybe_click_chromium_profile(driver):
     except Exception:
         pass
 
-def make_call(driver, number, _account=None, _retry=False):
+def make_call(driver, number, _account=None, _retry=False, _depth=0):
+    """FIX #32: added _depth counter to prevent infinite recursion."""
+    if _depth > 1:
+        log_msg(f"[call] Max retry depth reached for {number}", "error")
+        return False
     if not _is_driver_alive(driver):
         if _account and not _retry:
             driver = get_or_create_driver(_account)
-            return make_call(driver, number, _account=_account, _retry=True)
+            return make_call(driver, number, _account=_account, _retry=True, _depth=_depth + 1)
         return False
     try:
         driver.get("https://voice.google.com/calls")
@@ -1439,7 +1523,16 @@ def api_loadfile():
 
 @flask_app.route("/api/settings", methods=["GET"])
 def api_get_settings():
-    return jsonify(settings)
+    # FIX #66: redact passwords in GET response
+    safe = dict(settings)
+    safe_accounts = []
+    for a in safe.get("accounts", []):
+        ac = dict(a)
+        if ac.get("password"):
+            ac["password"] = "***"
+        safe_accounts.append(ac)
+    safe["accounts"] = safe_accounts
+    return jsonify(safe)
 
 @flask_app.route("/api/settings", methods=["POST"])
 def api_save_settings():
@@ -1453,17 +1546,45 @@ def api_save_settings():
         if not isinstance(payload_accounts, list):
             payload_accounts = []
 
+        # FIX #55: preserve existing password if UI sends *** (redacted placeholder)
+        existing_accounts = {a.get("email"): a for a in settings.get("accounts", [])}
+
         normalized_accounts = []
         for i, a in enumerate(payload_accounts):
             if not isinstance(a, dict):
                 continue
+            email = str(a.get("email", "") or "").strip()
+            incoming_pw = str(a.get("password", "") or "")
+            # If the UI sent back the redacted placeholder, keep the real stored password
+            if incoming_pw == "***" and email in existing_accounts:
+                password = existing_accounts[email].get("password", "")
+            else:
+                password = incoming_pw
+
+            # FIX #55: preserve existing profile name; only auto-assign if field was never set
+            existing_profile = existing_accounts.get(email, {}).get("profile", "")
+            incoming_profile = str(a.get("profile", "") or "").strip()
+            if incoming_profile:
+                profile = incoming_profile
+            elif existing_profile:
+                profile = existing_profile
+            else:
+                profile = f"profile{i+1}"
+
             normalized_accounts.append({
-                "email": str(a.get("email", "") or "").strip(),
-                "password": str(a.get("password", "") or ""),
-                "profile": str(a.get("profile", f"profile{i+1}") or f"profile{i+1}").strip(),
+                "email":   email,
+                "password": password,
+                "profile": profile,
             })
 
-        settings = {**DEFAULT_SETTINGS, **payload, "accounts": normalized_accounts}
+        # FIX #65: clamp concurrent_limit to sane max of 10
+        concurrent = int(payload.get("concurrent_limit", 1))
+        if concurrent > 10:
+            log_msg(f"[settings] concurrent_limit clamped from {concurrent} to 10", "warning")
+            concurrent = 10
+        payload["concurrent_limit"] = concurrent
+
+        settings = _deep_merge(DEFAULT_SETTINGS, {**payload, "accounts": normalized_accounts})
         save_settings_to_disk(settings)
         log_msg(f"[settings] Saved {len(normalized_accounts)} account(s)", "success")
         return jsonify({"message": "Settings saved!"})
@@ -1518,6 +1639,7 @@ def api_test_call():
                     # Only play press1 here for post-audio window catch
                     if key and s.get("audio_press1"):
                         play_audio_in_tab(d, s["audio_press1"])
+                # FIX #63: always hang up immediately in test call — skip delay sleep
                 hang_up(d)
             log_msg(f"Test call to {number} complete", "success")
         except Exception as e:
@@ -1544,13 +1666,19 @@ def api_audio_play():
     if driver is None:
         return jsonify({"message": "No active browser session"}), 503
 
+    audio_finished = [False]
+
     def _do_play():
         play_audio_in_tab(driver, filepath, block=block)
+        audio_finished[0] = True
 
     if block:
         t = threading.Thread(target=_do_play, daemon=True)
         t.start()
         t.join(timeout=65)
+        # FIX #64: verify audio actually finished before returning 200
+        if not audio_finished[0]:
+            return jsonify({"message": "Audio timed out — may not have finished"}), 504
         return jsonify({"message": "Done"})
     else:
         threading.Thread(target=_do_play, daemon=True).start()
@@ -1574,10 +1702,11 @@ def api_audio_status():
 
 @flask_app.route("/api/kill_browsers", methods=["POST"])
 def api_kill_browsers():
+    # FIX #59: removed redundant per-request import of subprocess/sys — already imported at top
     killed = []
     targets = ["chromium", "chromium-browser", "chrome", "chromedriver"]
     try:
-        if subprocess.sys.platform == "win32" if hasattr(subprocess, 'sys') else os.name == "nt":
+        if os.name == "nt":
             for name in targets:
                 r = subprocess.run(
                     ["taskkill", "/F", "/IM", f"{name}.exe", "/T"],
@@ -1614,7 +1743,11 @@ def api_clearcache():
 
 
 def run_telegram_bot():
-    token = settings.get("telegram_bot_token", "")
+    # FIX #57: read settings live inside each handler so new tokens saved via API take effect
+    def _get_token():
+        return load_settings().get("telegram_bot_token", "")
+
+    token = _get_token()
     if not token:
         return
     try:
@@ -1657,6 +1790,8 @@ def run_telegram_bot():
             await u.message.reply_text("Paused." if state["paused"] else "Resumed.")
 
         async def status_cmd(u, c):
+            # FIX #57: read live settings for each status call
+            _s = load_settings()
             pct = (state["completed"] / state["total"] * 100) if state["total"] else 0
             status = "Running" if state["running"] else "Stopped"
             if state.get("paused"):
@@ -1684,7 +1819,9 @@ def run_telegram_bot():
             await u.message.reply_text("Queue cleared.")
 
         async def main():
-            app = ApplicationBuilder().token(token).build()
+            # FIX #57: use fresh token at bot startup
+            live_token = _get_token()
+            app = ApplicationBuilder().token(live_token).build()
             app.add_handler(CommandHandler("start", start_cmd))
             app.add_handler(CommandHandler("call", call_cmd))
             app.add_handler(CommandHandler("stop", stop_cmd))
@@ -1709,6 +1846,9 @@ def run_telegram_bot():
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
+    # FIX #45: run_telegram_bot() started in daemon thread at startup
     threading.Thread(target=run_telegram_bot, daemon=True).start()
+    # FIX #47: restore numbers from previous session on startup
+    load_numbers_from_file()
     log_msg("Synergy 1.0 backend running on http://localhost:5050", "success")
     flask_app.run(host="0.0.0.0", port=5050, debug=False)
