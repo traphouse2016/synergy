@@ -62,6 +62,11 @@ def save_settings_to_disk(s):
         json.dump(s, f, indent=2)
 
 settings = load_settings()
+
+# FIX #23: login_status initialized at module level so /api/state never KeyErrors on cold start
+# FIX #56: _login_status_lock protects all login_status reads/writes across route + login threads
+_login_status_lock = threading.Lock()
+
 state = {
     "running": False,
     "paused": False,
@@ -312,14 +317,13 @@ def load_numbers_from_file():
         log_msg(f"Loaded {len(nums)} numbers from file.")
 
 def clear_cache():
-    import shutil as _sh
     cleared = 0
     if os.path.isdir(PROFILES_D):
         for profile in os.listdir(PROFILES_D):
             for cache_dir in ["Cache", "Code Cache", "GPUCache", "Service Worker"]:
                 path = os.path.join(PROFILES_D, profile, "Default", cache_dir)
                 if os.path.isdir(path):
-                    _sh.rmtree(path, ignore_errors=True); cleared += 1
+                    shutil.rmtree(path, ignore_errors=True); cleared += 1
     log_msg(f"Cache cleared ({cleared} dirs removed).", "success")
     return cleared
 
@@ -880,6 +884,7 @@ def _is_driver_alive(driver):
 
 def is_driver_alive(driver):
     return _is_driver_alive(driver)
+
 def _profile_name_for(account):
     explicit = account.get("profile", "").strip()
     if explicit and explicit not in ("profile_1", ""):
@@ -1225,12 +1230,14 @@ def hang_up(driver):
 
 # ── Campaign worker ───────────────────────────────────────────────────────────
 
-
+# FIX #4: hangup() was calling _hangup() which doesn't exist — replaced with hang_up(driver)
 def hangup(driver):
-    return _hangup(driver)
+    hang_up(driver)
+
 def _account_worker(account, num_queue, drivers, settings, lock):
     """Single-account worker — pulls numbers from shared queue and calls them."""
-    acc_key = _profile_name_for(account)
+    # FIX #24: acc_key must match key used in _drivers (global). Use profile_name_for_account.
+    acc_key = profile_name_for_account(account)
     email   = account["email"]
 
     driver = drivers.get(acc_key)
@@ -1366,19 +1373,18 @@ def campaign_worker():
     log_msg(f"Campaign starting — {len(numbers)} numbers, {concurrent} concurrent account(s)", "info")
 
     # ── Pre-flight: init browsers ─────────────────────────────────────────────
-    drivers = {}
-
-
+    # FIX #24: Do NOT create a local `drivers` dict that shadows _drivers.
+    # Populate _drivers directly so _account_worker receives the global registry.
     for acc in active_accs:
-        key = _profile_name_for(acc)
+        key = profile_name_for_account(acc)
         log_msg(f"[preflight] Initializing {acc['email']}...", "info")
         try:
-            drivers[key] = get_or_create_driver(acc)
+            _drivers[key] = get_or_create_driver(acc)
             log_msg(f"[preflight] ✓ {acc['email']} ready", "success")
         except Exception as e:
             log_msg(f"[preflight] ✗ {acc['email']} failed: {e}", "error")
 
-    ready = [a for a in active_accs if _profile_name_for(a) in drivers]
+    ready = [a for a in active_accs if profile_name_for_account(a) in _drivers]
     if not ready:
         log_msg("No accounts initialized — aborting.", "error")
         state["running"] = False; return
@@ -1394,7 +1400,8 @@ def campaign_worker():
     workers = []
     for acc in ready:
         t = threading.Thread(target=_account_worker,
-                             args=(acc, num_q, drivers, settings, lock),
+                             # FIX #24: pass global _drivers, not a local copy
+                             args=(acc, num_q, _drivers, settings, lock),
                              daemon=True)
         t.start()
         workers.append(t)
@@ -1402,9 +1409,11 @@ def campaign_worker():
     for t in workers:
         t.join()
 
-    for d in drivers.values():
-        try: d.quit()
-        except: pass
+    for key in [profile_name_for_account(a) for a in ready]:
+        d = _drivers.pop(key, None)
+        if d:
+            try: d.quit()
+            except: pass
 
     log_msg(f"Campaign done — {state['completed']} done, {state['failed']} failed", "success")
     state["running"] = False
@@ -1434,19 +1443,23 @@ def login_profile(profile):
 
     def _do_login():
         try:
-            state["login_status"][key] = "pending"
+            # FIX #56: lock around login_status write
+            with _login_status_lock:
+                state["login_status"][key] = "pending"
             log_msg(f"[login] Starting auto-login for {email} using profile: {profile_path}", "info")
             d = get_or_create_driver(account)
             _drivers[key] = d
-            state["login_status"][key] = "ok"
+            with _login_status_lock:
+                state["login_status"][key] = "ok"
             log_msg(f"[login] {email} ready using profile: {profile_path}", "success")
         except Exception as e:
-            state["login_status"][key] = "failed"
+            with _login_status_lock:
+                state["login_status"][key] = "failed"
             log_msg(f"[login] {email} failed using profile {profile_path}: {e}", "error")
 
-    if "login_status" not in state:
-        state["login_status"] = {}
-    state["login_status"][key] = "pending"
+    # FIX #56: lock around login_status write in route thread
+    with _login_status_lock:
+        state["login_status"][key] = "pending"
     threading.Thread(target=_do_login, daemon=True).start()
     return jsonify({
         "message": f"Opening Chromium for {email}...",
@@ -1456,7 +1469,10 @@ def login_profile(profile):
 
 @flask_app.route("/api/state")
 def api_state():
-    s = {**state, "log": state["log"][-60:]}
+    # FIX #56: lock around login_status read
+    with _login_status_lock:
+        login_status_snapshot = dict(state["login_status"])
+    s = {**state, "log": state["log"][-60:], "login_status": login_status_snapshot}
     try:
         s["profiles_dir"] = PROFILES_D
         s["accounts"] = [a.get("email", "") for a in settings.get("accounts", []) if a.get("email")]
@@ -1644,11 +1660,10 @@ def api_audio_status():
 @flask_app.route("/api/kill_browsers", methods=["POST"])
 def api_kill_browsers():
     """Force-kill ALL Chromium and chromedriver processes system-wide, then clear driver registry."""
-    import subprocess, sys
     killed = []
     targets = ["chromium", "chromium-browser", "chrome", "chromedriver"]
     try:
-        if sys.platform == "win32":
+        if subprocess.sys.platform == "win32" if hasattr(subprocess, 'sys') else os.name == "nt":
             for name in targets:
                 r = subprocess.run(
                     ["taskkill", "/F", "/IM", f"{name}.exe", "/T"],
