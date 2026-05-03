@@ -502,6 +502,11 @@ code{background:var(--surface2);border:1px solid var(--border);border-radius:3px
           <span class="toggle-desc">detect vm and take action</span>
         </div>
         <div class="toggle-row">
+          <label class="toggle"><input type="checkbox" id="s-vmhangup"><span class="slider"></span></label>
+          <span class="toggle-lbl">vm hangup</span>
+          <span class="toggle-desc">hang up immediately when voicemail detected</span>
+        </div>
+        <div class="toggle-row">
           <label class="toggle"><input type="checkbox" id="s-screencalls"><span class="slider"></span></label>
           <span class="toggle-lbl">screen calls (outgoing)</span>
           <span class="toggle-desc">enable "state your name" on your incoming calls</span>
@@ -575,7 +580,7 @@ code{background:var(--surface2);border:1px solid var(--border);border-radius:3px
     <div class="card">
       <div class="card-head">active chromium profiles</div>
       <div class="card-body">
-        <div id="browsers-profile-list" style="font-size:0.85em;color:var(--text-muted);margin-bottom:10px;">
+        <div id="browsers-profile-list" style="font-size:0.85em;color:var(--text);margin-bottom:10px;">
           Loading active profiles...
         </div>
         <button class="btn small" id="btn-refresh-profiles">↺ refresh</button>
@@ -585,19 +590,19 @@ code{background:var(--surface2);border:1px solid var(--border);border-radius:3px
     <div class="card">
       <div class="card-head">session controls</div>
       <div class="card-body" style="display:flex;flex-direction:column;gap:12px;">
-        <p style="color:var(--text-muted);font-size:0.85em;">Manage all active Chromium windows and driver sessions launched by Synergy.</p>
+        <p style="color:var(--muted);font-size:0.85em;">Manage all active Chromium windows and driver sessions launched by Synergy.</p>
         <div style="display:flex;gap:8px;flex-wrap:wrap;">
           <button class="btn warn"   id="btn-close-browsers">✕ close all browsers</button>
           <button class="btn danger" id="btn-kill-browsers">☠ force kill all chromium</button>
         </div>
-        <div id="browsers-msg" style="font-size:0.8em;color:var(--text-muted);"></div>
+        <div id="browsers-msg" style="font-size:0.8em;color:var(--muted);"></div>
       </div>
     </div>
 
     <div class="card">
       <div class="card-head">cache &amp; logins</div>
       <div class="card-body" style="display:flex;flex-direction:column;gap:10px;">
-        <p style="color:var(--text-muted);font-size:0.85em;">Clear stored browser cache and login sessions. You will need to log in to Google Voice again after clearing.</p>
+        <p style="color:var(--muted);font-size:0.85em;">Clear stored browser cache and login sessions. You will need to log in to Google Voice again after clearing.</p>
         <div style="display:flex;gap:8px;">
           <button class="btn warn" id="btn-clear-cache">🗑 clear cache &amp; logins</button>
         </div>
@@ -618,6 +623,14 @@ code{background:var(--surface2);border:1px solid var(--border);border-radius:3px
 <script>
 const THEMES = ['hacker-orange','hacker-red','midnight','matrix','neon-purple'];
 const http   = require('http');
+
+// FIX #1: derive canonical profile key the same way backend does:
+// profile_name_for_account → "gvbot_" + email prefix stripped of special chars
+function profileKeyFromEmail(email) {
+  if (!email) return '';
+  const prefix = email.split('@')[0].replace(/[^a-z0-9]/gi, '').toLowerCase();
+  return 'gvbot_' + prefix;
+}
 
 // ── Theme ──────────────────────────────────────────────────────────────────
 let themeIdx = 0;
@@ -758,20 +771,30 @@ async function poll() {
       fl.scrollTop = fl.scrollHeight;
     }
 
-    // Login dots
+    // FIX #1: Login dots — derive canonical key from email the same way backend does
     if (d.login_status) {
       Object.entries(d.login_status).forEach(([p, s]) => {
         const el = document.querySelector(`[data-dot="${p}"]`);
         if (el) el.className = 'dot ' + s;
       });
     }
+    // Also update dots by deriving key from current accs emails
+    accs.forEach(a => {
+      if (!a.email) return;
+      const key = profileKeyFromEmail(a.email);
+      const status = d.login_status && d.login_status[key];
+      if (status) {
+        const el = document.querySelector(`[data-dot="${key}"]`);
+        if (el) el.className = 'dot ' + status;
+      }
+    });
   } catch(e) { document.getElementById('statusLabel').textContent = 'offline'; }
 }
 setInterval(poll, 1500); poll();
 
 // ── Campaign ──────────────────────────────────────────────────────────────
 document.getElementById('btn-start').onclick = async () => {
-  try { const d = await post('/api/start'); toast(d.message,'success'); } catch{ toast('backend offline','error'); }
+  try { const d = await post('/api/start'); toast(d.message,'success'); } catch(e){ toast((e&&e.message)||'backend offline','error'); }
 };
 document.getElementById('btn-stop').onclick = async () => {
   try {
@@ -780,10 +803,10 @@ document.getElementById('btn-stop').onclick = async () => {
     document.getElementById('st-pct').textContent = '0%';
     document.getElementById('prog').style.width = '0%';
     toast('stopped & reset','warning');
-  } catch{ toast('backend offline','error'); }
+  } catch(e){ toast((e&&e.message)||'backend offline','error'); }
 };
 document.getElementById('btn-pause').onclick = async () => {
-  try { const d = await post('/api/pause'); toast(d.message,'warning'); } catch{ toast('backend offline','error'); }
+  try { const d = await post('/api/pause'); toast(d.message,'warning'); } catch(e){ toast((e&&e.message)||'backend offline','error'); }
 };
 
 
@@ -795,7 +818,7 @@ document.getElementById('btn-kill-browsers').onclick = async () => {
     const d = await post('/api/kill_browsers', {});
     msg.textContent = d.message || 'Done';
     toast(d.message || 'All Chromium processes killed', 'success');
-  } catch { msg.textContent = 'Backend offline'; toast('kill error','error'); }
+  } catch(e) { msg.textContent = (e&&e.message)||'Backend offline'; toast('kill error','error'); }
 };
 
 async function refreshProfiles() {
@@ -810,11 +833,11 @@ async function refreshProfiles() {
     } else {
       el.innerHTML = accounts.map(a => {
         const active = a === acctKey;
-        return `<div style="padding:4px 0;border-bottom:1px solid var(--color-border);">
-          <span style="color:${active ? 'var(--color-primary)' : 'var(--color-text)'}">
+        return `<div style="padding:4px 0;border-bottom:1px solid var(--border);">
+          <span style="color:${active ? 'var(--accent)' : 'var(--text)'}">
             ${active ? '▶ ' : ''}${a}
           </span>
-          ${active ? '<span style="color:var(--color-primary);font-size:0.75em;"> (active call)</span>' : ''}
+          ${active ? '<span style="color:var(--accent);font-size:0.75em;"> (active call)</span>' : ''}
         </div>`;
       }).join('');
     }
@@ -823,15 +846,16 @@ async function refreshProfiles() {
 
 document.getElementById('btn-refresh-profiles').onclick = refreshProfiles;
 
+// FIX #3: removed first duplicate btn-clear-cache onclick — only one registration below
 document.getElementById('btn-clear-cache').onclick = async () => {
   if (!confirm('Clear all browser cache and login sessions? You will need to log in again.')) return;
   const msg = document.getElementById('browsers-msg');
-  msg.textContent = 'Clearing...';
+  msg.textContent = 'Clearing cache...';
   try {
     const d = await post('/api/clearcache', {});
-    msg.textContent = d.message || 'Done';
+    msg.textContent = d.message || 'Cache cleared';
     toast(d.message || 'Cache cleared', 'success');
-  } catch { msg.textContent = 'Backend offline'; toast('error','error'); }
+  } catch(e) { msg.textContent = (e&&e.message)||'Backend offline'; toast('error clearing cache','error'); }
 };
 
 document.getElementById('btn-close-browsers').onclick = async () => {
@@ -841,17 +865,7 @@ document.getElementById('btn-close-browsers').onclick = async () => {
     const d = await post('/api/close_browsers', {});
     msg.textContent = d.message || 'Done';
     toast(d.message || 'All browsers closed', 'success');
-  } catch { msg.textContent = 'Backend offline'; toast('error closing browsers','error'); }
-};
-
-document.getElementById('btn-clear-cache').onclick = async () => {
-  const msg = document.getElementById('browsers-msg');
-  msg.textContent = 'Clearing cache...';
-  try {
-    const d = await post('/api/clearcache', {});
-    msg.textContent = d.message || 'Cache cleared';
-    toast(d.message || 'Cache cleared', 'success');
-  } catch { msg.textContent = 'Backend offline'; toast('error clearing cache','error'); }
+  } catch(e) { msg.textContent = (e&&e.message)||'Backend offline'; toast('error closing browsers','error'); }
 };
 
 document.getElementById('btn-audio-play').onclick = async () => {
@@ -864,7 +878,7 @@ document.getElementById('btn-audio-play').onclick = async () => {
     const d = await post('/api/audio/play', { filepath, account_key: acctKey, block: false });
     statusEl.textContent = d.message || 'Playing';
     toast(d.message || 'Playing audio in call','success');
-  } catch(e) { statusEl.textContent = 'Error — is a call active?'; toast('audio error','error'); }
+  } catch(e) { statusEl.textContent = 'Error — is a call active?'; toast((e&&e.message)||'audio error','error'); }
 };
 
 document.getElementById('btn-audio-status').onclick = async () => {
@@ -880,7 +894,7 @@ document.getElementById('btn-audio-status').onclick = async () => {
 document.getElementById('btn-test').onclick = async () => {
   const n = document.getElementById('test-num').value.trim();
   if (!n) { toast('enter a number','error'); return; }
-  try { const d = await post('/api/test_call',{number:n}); toast(d.message,'success'); } catch{ toast('backend offline','error'); }
+  try { const d = await post('/api/test_call',{number:n}); toast(d.message,'success'); } catch(e){ toast((e&&e.message)||'backend offline','error'); }
 };
 document.getElementById('btn-tg').onclick = async () => {
   const m = document.getElementById('tg-msg').value.trim();
@@ -900,7 +914,7 @@ document.getElementById('file-picker').onchange = function() {
 document.getElementById('btn-loadnums').onclick = async () => {
   const lines = document.getElementById('nums-ta').value.split('\n').map(s=>s.trim()).filter(Boolean);
   if (!lines.length) { toast('no numbers entered','error'); return; }
-  try { const d = await post('/api/numbers/load',{numbers:lines}); toast(d.message,'success'); } catch{ toast('backend offline','error'); }
+  try { const d = await post('/api/numbers/load',{numbers:lines}); toast(d.message,'success'); } catch(e){ toast((e&&e.message)||'backend offline','error'); }
 };
 document.getElementById('btn-clearnums').onclick = async () => {
   try {
@@ -908,27 +922,32 @@ document.getElementById('btn-clearnums').onclick = async () => {
     document.getElementById('nums-ta').value = '';
     document.getElementById('file-lbl').textContent = 'no file';
     toast('queue cleared','success');
-  } catch{ toast('backend offline','error'); }
+  } catch(e){ toast((e&&e.message)||'backend offline','error'); }
 };
 
 // ── Accounts ──────────────────────────────────────────────────────────────
 let accs = [];
 function renderAccs() {
   const el = document.getElementById('accs-list');
-  el.innerHTML = accs.map((a,i) => `
+  el.innerHTML = accs.map((a,i) => {
+    // FIX #1: derive canonical key from email for data-dot attribute
+    const canonKey = profileKeyFromEmail(a.email);
+    const dotKey   = canonKey || (a.profile || ('profile'+(i+1)));
+    return `
     <div class="acc-row">
       <input type="text"     value="${a.email||''}"   placeholder="account@gmail.com"   data-i="${i}" data-f="email">
       <input type="password" value="${a.password||''}" placeholder="password"            data-i="${i}" data-f="password">
       <input type="text"     value="${a.profile||('profile'+(i+1))}" placeholder="profile${i+1}" data-i="${i}" data-f="profile">
-      <button class="login-btn" data-profile="${a.profile||'profile'+(i+1)}" data-email="${a.email||''}">
-        <span class="dot" data-dot="${a.profile||'profile'+(i+1)}"></span> login
+      <button class="login-btn" data-i="${i}">
+        <span class="dot" data-dot="${dotKey}"></span> login
       </button>
       <button class="acc-del" data-i="${i}">✕</button>
-    </div>`).join('');
+    </div>`;
+  }).join('');
   el.querySelectorAll('input').forEach(inp => {
     inp.oninput = () => {
       accs[+inp.dataset.i][inp.dataset.f] = inp.value;
-      if (inp.dataset.f === 'profile') renderAccs();
+      if (inp.dataset.f === 'email' || inp.dataset.f === 'profile') renderAccs();
     };
   });
   el.querySelectorAll('.acc-del').forEach(b => {
@@ -936,14 +955,19 @@ function renderAccs() {
   });
   el.querySelectorAll('.login-btn').forEach(b => {
     b.onclick = async () => {
-      const p = b.dataset.profile;
-      const email = b.dataset.email || '';
+      const i = +b.dataset.i;
+      const row = b.closest('.acc-row');
+      // FIX #2: read email live from the sibling input at click time, not stale data-email
+      const emailInput = row.querySelector('input[data-f="email"]');
+      const profileInput = row.querySelector('input[data-f="profile"]');
+      const email = emailInput ? emailInput.value.trim() : (accs[i] && accs[i].email) || '';
+      const p = profileInput ? profileInput.value.trim() : (accs[i] && accs[i].profile) || ('profile'+(i+1));
       b.disabled = true;
       try {
         const d = await post('/api/login/' + encodeURIComponent(p), { email });
         toast((d.message || 'Opening Chromium...') + (d.profile_path ? ('\n' + d.profile_path) : ''),'info');
-      } catch {
-        toast('backend offline','error');
+      } catch(e) {
+        toast((e&&e.message)||'backend offline','error');
       }
       setTimeout(() => { b.disabled = false; }, 3000);
     };
@@ -984,6 +1008,8 @@ async function loadSettings() {
     document.getElementById('s-headless').checked   = !!s.headless;
     document.getElementById('s-dtmf').checked       = !!s.dtmf_enabled;
     document.getElementById('s-vm').checked         = !!s.vm_detection_enabled;
+    // FIX #37: load vm_hangup toggle
+    document.getElementById('s-vmhangup').checked   = s.vm_hangup !== undefined ? !!s.vm_hangup : true;
     document.getElementById('s-audio-bypass').value = s.audio_screen_bypass || '';
     document.getElementById('s-audio-initial').value= s.audio_initial       || '';
     document.getElementById('s-audio-press1').value = s.audio_press1        || '';
@@ -1004,6 +1030,7 @@ document.getElementById('btn-save').onclick = async () => {
     dtmf_key_to_detect:   document.getElementById('s-dtmfkey').value,
     dtmf_timeout:         parseInt(document.getElementById('s-dtmftimeout').value)||20,
     vm_action:            document.getElementById('s-vmaction').value,
+    vm_hangup:            document.getElementById('s-vmhangup').checked,
     rotate_accounts:      document.getElementById('s-rotate').checked,
     headless:             document.getElementById('s-headless').checked,
     dtmf_enabled:         document.getElementById('s-dtmf').checked,
