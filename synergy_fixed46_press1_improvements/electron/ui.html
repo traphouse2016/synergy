@@ -259,6 +259,18 @@ input:checked+.slider:before{background:var(--accent);transform:translateX(14px)
 a{color:var(--accent);text-decoration:none;}
 a:hover{text-decoration:underline;}
 code{background:var(--surface2);border:1px solid var(--border);border-radius:3px;padding:1px 5px;font-size:11px;}
+
+/* ── #39: Browsers tab — fix invisible text by using correct CSS vars ── */
+#page-browsers .card-body p,
+#page-browsers .card-body,
+#browsers-profile-list,
+#browsers-msg {
+  color: var(--text);
+}
+#browsers-profile-list div {
+  border-bottom: 1px solid var(--border);
+  color: var(--text);
+}
 </style>
 </head>
 <body>
@@ -349,7 +361,7 @@ code{background:var(--surface2);border:1px solid var(--border);border-radius:3px
         <button class="btn primary" id="btn-audio-play">▶ play in call</button>
         <button class="btn" id="btn-audio-status">⬤ status</button>
       </div>
-      <div id="audio-status-msg" style="margin-top:6px;font-size:0.8em;color:var(--text-muted);"></div>
+      <div id="audio-status-msg" style="margin-top:6px;font-size:0.8em;color:var(--muted);"></div>
     </div>
 
     <div class="card">
@@ -377,6 +389,7 @@ code{background:var(--surface2);border:1px solid var(--border);border-radius:3px
       <div class="card" style="margin-bottom:0">
         <div class="card-head">queue — one per line</div>
         <div class="card-body">
+          <!-- #40: drag-and-drop on textarea -->
           <textarea id="nums-ta" style="min-height:320px;resize:vertical;font-family:'Courier New',monospace;font-size:12px" placeholder="+13105550001&#10;+13105550002"></textarea>
           <div class="actions" style="margin-top:10px">
             <button class="btn primary" id="btn-loadnums">↑ load to queue</button>
@@ -501,6 +514,7 @@ code{background:var(--surface2);border:1px solid var(--border);border-radius:3px
           <span class="toggle-lbl">voicemail detection</span>
           <span class="toggle-desc">detect vm and take action</span>
         </div>
+        <!-- #37: vm_hangup toggle -->
         <div class="toggle-row">
           <label class="toggle"><input type="checkbox" id="s-vmhangup"><span class="slider"></span></label>
           <span class="toggle-lbl">vm hangup</span>
@@ -580,7 +594,7 @@ code{background:var(--surface2);border:1px solid var(--border);border-radius:3px
     <div class="card">
       <div class="card-head">active chromium profiles</div>
       <div class="card-body">
-        <div id="browsers-profile-list" style="font-size:0.85em;color:var(--text);margin-bottom:10px;">
+        <div id="browsers-profile-list" style="font-size:0.85em;margin-bottom:10px;">
           Loading active profiles...
         </div>
         <button class="btn small" id="btn-refresh-profiles">↺ refresh</button>
@@ -590,19 +604,19 @@ code{background:var(--surface2);border:1px solid var(--border);border-radius:3px
     <div class="card">
       <div class="card-head">session controls</div>
       <div class="card-body" style="display:flex;flex-direction:column;gap:12px;">
-        <p style="color:var(--muted);font-size:0.85em;">Manage all active Chromium windows and driver sessions launched by Synergy.</p>
+        <p style="font-size:0.85em;">Manage all active Chromium windows and driver sessions launched by Synergy.</p>
         <div style="display:flex;gap:8px;flex-wrap:wrap;">
           <button class="btn warn"   id="btn-close-browsers">✕ close all browsers</button>
           <button class="btn danger" id="btn-kill-browsers">☠ force kill all chromium</button>
         </div>
-        <div id="browsers-msg" style="font-size:0.8em;color:var(--muted);"></div>
+        <div id="browsers-msg" style="font-size:0.8em;"></div>
       </div>
     </div>
 
     <div class="card">
       <div class="card-head">cache &amp; logins</div>
       <div class="card-body" style="display:flex;flex-direction:column;gap:10px;">
-        <p style="color:var(--muted);font-size:0.85em;">Clear stored browser cache and login sessions. You will need to log in to Google Voice again after clearing.</p>
+        <p style="font-size:0.85em;">Clear stored browser cache and login sessions. You will need to log in to Google Voice again after clearing.</p>
         <div style="display:flex;gap:8px;">
           <button class="btn warn" id="btn-clear-cache">🗑 clear cache &amp; logins</button>
         </div>
@@ -707,6 +721,10 @@ function get(path) {
 
 // ── Poll ──────────────────────────────────────────────────────────────────
 let lastLogLen = 0;
+// #38: track previous running state to detect campaign completion
+let _wasRunning = false;
+let _prevCompleted = 0;
+
 async function poll() {
   try {
     const d = await get('/api/state');
@@ -771,6 +789,13 @@ async function poll() {
       fl.scrollTop = fl.scrollHeight;
     }
 
+    // FIX #38: campaign-complete notification — detect transition from running→stopped with progress
+    if (_wasRunning && !d.running && d.total > 0) {
+      const finalPct = d.total > 0 ? Math.round(d.completed / d.total * 100) : 0;
+      toast(`✓ Campaign complete — ${d.completed}/${d.total} dialed (${finalPct}%)`, 'success');
+    }
+    _wasRunning = !!d.running;
+
     // FIX #1: Login dots — derive canonical key from email the same way backend does
     if (d.login_status) {
       Object.entries(d.login_status).forEach(([p, s]) => {
@@ -793,20 +818,21 @@ async function poll() {
 setInterval(poll, 1500); poll();
 
 // ── Campaign ──────────────────────────────────────────────────────────────
+// FIX #36: show d.message from response body instead of generic 'backend offline'
 document.getElementById('btn-start').onclick = async () => {
-  try { const d = await post('/api/start'); toast(d.message,'success'); } catch(e){ toast((e&&e.message)||'backend offline','error'); }
+  try { const d = await post('/api/start'); toast(d.message,'success'); } catch(e){ toast((e&&e.message)||'start failed','error'); }
 };
 document.getElementById('btn-stop').onclick = async () => {
   try {
-    await post('/api/stop');
+    const d = await post('/api/stop');
     ['st-total','st-done','st-fail'].forEach(id => document.getElementById(id).textContent = '0');
     document.getElementById('st-pct').textContent = '0%';
     document.getElementById('prog').style.width = '0%';
-    toast('stopped & reset','warning');
-  } catch(e){ toast((e&&e.message)||'backend offline','error'); }
+    toast((d&&d.message)||'stopped & reset','warning');
+  } catch(e){ toast((e&&e.message)||'stop failed','error'); }
 };
 document.getElementById('btn-pause').onclick = async () => {
-  try { const d = await post('/api/pause'); toast(d.message,'warning'); } catch(e){ toast((e&&e.message)||'backend offline','error'); }
+  try { const d = await post('/api/pause'); toast(d.message,'warning'); } catch(e){ toast((e&&e.message)||'pause failed','error'); }
 };
 
 
@@ -818,7 +844,7 @@ document.getElementById('btn-kill-browsers').onclick = async () => {
     const d = await post('/api/kill_browsers', {});
     msg.textContent = d.message || 'Done';
     toast(d.message || 'All Chromium processes killed', 'success');
-  } catch(e) { msg.textContent = (e&&e.message)||'Backend offline'; toast('kill error','error'); }
+  } catch(e) { msg.textContent = (e&&e.message)||'Error'; toast((e&&e.message)||'kill error','error'); }
 };
 
 async function refreshProfiles() {
@@ -833,7 +859,7 @@ async function refreshProfiles() {
     } else {
       el.innerHTML = accounts.map(a => {
         const active = a === acctKey;
-        return `<div style="padding:4px 0;border-bottom:1px solid var(--border);">
+        return `<div style="padding:4px 0;">
           <span style="color:${active ? 'var(--accent)' : 'var(--text)'}">
             ${active ? '▶ ' : ''}${a}
           </span>
@@ -841,12 +867,12 @@ async function refreshProfiles() {
         </div>`;
       }).join('');
     }
-  } catch { el.textContent = 'Backend offline.'; }
+  } catch(e) { el.textContent = (e&&e.message)||'Backend offline.'; }
 }
 
 document.getElementById('btn-refresh-profiles').onclick = refreshProfiles;
 
-// FIX #3: removed first duplicate btn-clear-cache onclick — only one registration below
+// FIX #3: single btn-clear-cache registration
 document.getElementById('btn-clear-cache').onclick = async () => {
   if (!confirm('Clear all browser cache and login sessions? You will need to log in again.')) return;
   const msg = document.getElementById('browsers-msg');
@@ -855,7 +881,7 @@ document.getElementById('btn-clear-cache').onclick = async () => {
     const d = await post('/api/clearcache', {});
     msg.textContent = d.message || 'Cache cleared';
     toast(d.message || 'Cache cleared', 'success');
-  } catch(e) { msg.textContent = (e&&e.message)||'Backend offline'; toast('error clearing cache','error'); }
+  } catch(e) { msg.textContent = (e&&e.message)||'Error'; toast((e&&e.message)||'error clearing cache','error'); }
 };
 
 document.getElementById('btn-close-browsers').onclick = async () => {
@@ -865,7 +891,7 @@ document.getElementById('btn-close-browsers').onclick = async () => {
     const d = await post('/api/close_browsers', {});
     msg.textContent = d.message || 'Done';
     toast(d.message || 'All browsers closed', 'success');
-  } catch(e) { msg.textContent = (e&&e.message)||'Backend offline'; toast('error closing browsers','error'); }
+  } catch(e) { msg.textContent = (e&&e.message)||'Error'; toast((e&&e.message)||'error closing browsers','error'); }
 };
 
 document.getElementById('btn-audio-play').onclick = async () => {
@@ -878,7 +904,7 @@ document.getElementById('btn-audio-play').onclick = async () => {
     const d = await post('/api/audio/play', { filepath, account_key: acctKey, block: false });
     statusEl.textContent = d.message || 'Playing';
     toast(d.message || 'Playing audio in call','success');
-  } catch(e) { statusEl.textContent = 'Error — is a call active?'; toast((e&&e.message)||'audio error','error'); }
+  } catch(e) { statusEl.textContent = (e&&e.message)||'Error — is a call active?'; toast((e&&e.message)||'audio error','error'); }
 };
 
 document.getElementById('btn-audio-status').onclick = async () => {
@@ -894,15 +920,38 @@ document.getElementById('btn-audio-status').onclick = async () => {
 document.getElementById('btn-test').onclick = async () => {
   const n = document.getElementById('test-num').value.trim();
   if (!n) { toast('enter a number','error'); return; }
-  try { const d = await post('/api/test_call',{number:n}); toast(d.message,'success'); } catch(e){ toast((e&&e.message)||'backend offline','error'); }
+  try { const d = await post('/api/test_call',{number:n}); toast(d.message,'success'); } catch(e){ toast((e&&e.message)||'test call failed','error'); }
 };
 document.getElementById('btn-tg').onclick = async () => {
   const m = document.getElementById('tg-msg').value.trim();
   if (!m) return;
-  try { const d = await post('/api/telegram/send',{message:m}); toast(d.message,'success'); } catch{}
+  try { const d = await post('/api/telegram/send',{message:m}); toast(d.message,'success'); } catch(e){ toast((e&&e.message)||'send failed','error'); }
 };
 
 // ── Numbers ───────────────────────────────────────────────────────────────
+// FIX #69: normalize numbers to E.164 on load, warn on invalid
+function normalizeNumbers(lines) {
+  const valid = [];
+  const invalid = [];
+  lines.forEach(raw => {
+    const digits = raw.replace(/\D/g, '');
+    if (digits.length === 10) {
+      valid.push('+1' + digits);
+    } else if (digits.length === 11 && digits.startsWith('1')) {
+      valid.push('+' + digits);
+    } else if (digits.length > 7) {
+      // international or already formatted
+      valid.push('+' + digits);
+    } else {
+      invalid.push(raw);
+    }
+  });
+  if (invalid.length) {
+    toast(`⚠ ${invalid.length} invalid number(s) skipped`, 'warning');
+  }
+  return valid;
+}
+
 document.getElementById('btn-selectfile').onclick = () => document.getElementById('file-picker').click();
 document.getElementById('file-picker').onchange = function() {
   const f = this.files[0]; if (!f) return;
@@ -911,10 +960,36 @@ document.getElementById('file-picker').onchange = function() {
   r.onload = e => { document.getElementById('nums-ta').value = e.target.result.trim(); toast('loaded ' + f.name,'success'); };
   r.readAsText(f); this.value = '';
 };
+
+// FIX #40: drag-and-drop on numbers textarea
+(function() {
+  const ta = document.getElementById('nums-ta');
+  ta.addEventListener('dragover', e => { e.preventDefault(); ta.style.borderColor = 'var(--accent)'; });
+  ta.addEventListener('dragleave', () => { ta.style.borderColor = ''; });
+  ta.addEventListener('drop', e => {
+    e.preventDefault();
+    ta.style.borderColor = '';
+    const file = e.dataTransfer.files && e.dataTransfer.files[0];
+    if (file && file.name.endsWith('.txt')) {
+      document.getElementById('file-lbl').textContent = file.name;
+      const r = new FileReader();
+      r.onload = ev => { ta.value = ev.target.result.trim(); toast('dropped ' + file.name, 'success'); };
+      r.readAsText(file);
+    } else if (e.dataTransfer.getData('text')) {
+      ta.value = (ta.value ? ta.value + '\n' : '') + e.dataTransfer.getData('text').trim();
+      toast('text dropped into queue', 'success');
+    }
+  });
+})();
+
 document.getElementById('btn-loadnums').onclick = async () => {
-  const lines = document.getElementById('nums-ta').value.split('\n').map(s=>s.trim()).filter(Boolean);
-  if (!lines.length) { toast('no numbers entered','error'); return; }
-  try { const d = await post('/api/numbers/load',{numbers:lines}); toast(d.message,'success'); } catch(e){ toast((e&&e.message)||'backend offline','error'); }
+  const raw = document.getElementById('nums-ta').value.split('\n').map(s=>s.trim()).filter(Boolean);
+  if (!raw.length) { toast('no numbers entered','error'); return; }
+  // FIX #69: normalize before sending
+  const lines = normalizeNumbers(raw);
+  if (!lines.length) { toast('no valid numbers to load','error'); return; }
+  document.getElementById('nums-ta').value = lines.join('\n');
+  try { const d = await post('/api/numbers/load',{numbers:lines}); toast(d.message,'success'); } catch(e){ toast((e&&e.message)||'load failed','error'); }
 };
 document.getElementById('btn-clearnums').onclick = async () => {
   try {
@@ -922,7 +997,7 @@ document.getElementById('btn-clearnums').onclick = async () => {
     document.getElementById('nums-ta').value = '';
     document.getElementById('file-lbl').textContent = 'no file';
     toast('queue cleared','success');
-  } catch(e){ toast((e&&e.message)||'backend offline','error'); }
+  } catch(e){ toast((e&&e.message)||'clear failed','error'); }
 };
 
 // ── Accounts ──────────────────────────────────────────────────────────────
@@ -967,7 +1042,8 @@ function renderAccs() {
         const d = await post('/api/login/' + encodeURIComponent(p), { email });
         toast((d.message || 'Opening Chromium...') + (d.profile_path ? ('\n' + d.profile_path) : ''),'info');
       } catch(e) {
-        toast((e&&e.message)||'backend offline','error');
+        // FIX #36: show real error message from backend
+        toast((e&&e.message)||'login failed','error');
       }
       setTimeout(() => { b.disabled = false; }, 3000);
     };
@@ -1030,6 +1106,7 @@ document.getElementById('btn-save').onclick = async () => {
     dtmf_key_to_detect:   document.getElementById('s-dtmfkey').value,
     dtmf_timeout:         parseInt(document.getElementById('s-dtmftimeout').value)||20,
     vm_action:            document.getElementById('s-vmaction').value,
+    // FIX #37: include vm_hangup in save payload
     vm_hangup:            document.getElementById('s-vmhangup').checked,
     rotate_accounts:      document.getElementById('s-rotate').checked,
     headless:             document.getElementById('s-headless').checked,
@@ -1049,6 +1126,7 @@ document.getElementById('btn-save').onclick = async () => {
     document.getElementById('save-status').textContent = 'saved ✓';
     setTimeout(() => { document.getElementById('save-status').textContent = ''; }, 2000);
   } catch (e) {
+    // FIX #36: show real error message from backend
     const msg = (e && e.message) ? e.message : 'save failed';
     toast(msg,'error');
     document.getElementById('save-status').textContent = 'save failed';
