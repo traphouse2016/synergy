@@ -1,4 +1,4 @@
-# DEFAULT_BASE_BUILD: fixed46_press1_tg_filter_vm_fastfail
+# DEFAULT_BASE_BUILD: fixed46_contacts_parser_tg_addnumbers
 #!/usr/bin/env python3
 """Synergy 1.0 — FFT-based DTMF detection via Web Audio CDP injection"""
 
@@ -109,19 +109,88 @@ state = {
     "running": False,
     "paused": False,
     "login_status": {}, "numbers": [], "completed": 0, "failed": 0,
-    "total": 0, "current_number": "", "current_account": "",
+    "total": 0, "current_number": "", "current_contact": "", "current_account": "",
     "log": [], "_stop": False,
 }
 # FIX: _clear_numbers_file() is called below after the function is defined.
+
+# ── Contact parsing helpers ───────────────────────────────────────────────────
+
+def _extract_phone(line):
+    """Extract the first valid US 10-digit phone number from any formatted line.
+    Handles +1 prefix, parentheses, dashes, dots, spaces, semicolons.
+    Skips ISO date/timestamp sequences so dates are not mistaken for phone numbers.
+    """
+    s = re.sub(r'\b\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}:\d{2}[\d.]*)?', ' ', line)
+    phone_pat = re.compile(
+        r'\+?1?[\s.\-]?'
+        r'\(?(\d{3})\)?[\s.\-]?'
+        r'(\d{3})[\s.\-]?'
+        r'(\d{4})'
+    )
+    for m in phone_pat.finditer(s):
+        digits = ''.join(m.groups())
+        if len(digits) == 10:
+            return digits
+    m = re.search(r'(?<!\d)(\d{10})(?!\d)', s)
+    if m:
+        return m.group(1)
+    return None
+
+
+def _parse_contact_lines(lines):
+    """Parse raw contact lines into pipe-format entries with deduplication.
+    Returns (entries, skipped_count).
+    Entry format: 'dialnum|full_original_line'
+    Already-stored pipe-format entries are passed through unchanged.
+    """
+    entries = []
+    seen = set()
+    skipped = 0
+    for raw in lines:
+        line = raw.strip()
+        if not line:
+            continue
+        if '|' in line:
+            num = line.split('|', 1)[0].strip()
+            if len(num) == 10 and num.isdigit():
+                if num not in seen:
+                    seen.add(num)
+                    entries.append(line)
+                continue
+        num = _extract_phone(line)
+        if num is None:
+            skipped += 1
+            continue
+        if num in seen:
+            continue
+        seen.add(num)
+        entries.append(f"{num}|{line}")
+    return entries, skipped
+
+
+def _unpack_entry(entry):
+    """Unpack a stored entry into (dial_number, contact_label).
+    Backward-compatible: bare number entries return (number, number).
+    """
+    if '|' in entry:
+        num, label = entry.split('|', 1)
+        return num.strip(), label.strip()
+    return entry.strip(), entry.strip()
+
 
 # FIX: load_numbers_from_file() is only called explicitly via /api/numbers/loadfile —
 # numbers are NOT auto-restored on startup so stale queues never bleed between sessions.
 def load_numbers_from_file():
     if os.path.exists(NUMBERS_F):
         with open(NUMBERS_F) as f:
-            nums = [l.strip() for l in f if l.strip()]
-        state.update({"numbers": nums, "total": len(nums), "completed": 0, "failed": 0})
-        log_msg(f"Loaded {len(nums)} numbers from file.")
+            raw_lines = [l.strip() for l in f if l.strip()]
+        entries, skipped = _parse_contact_lines(raw_lines)
+        state.update({"numbers": entries, "total": len(entries), "completed": 0, "failed": 0})
+        msg = f"Loaded {len(entries)} contact(s)"
+        if skipped:
+            msg += f" ({skipped} skipped — no valid number)"
+        log_msg(msg)
 
 def _clear_numbers_file():
     """Wipe numbers.txt on startup so old queues never auto-reload."""
@@ -192,9 +261,11 @@ def tg_notify(msg):
     # FIX: fire-and-forget — worker thread never blocks on Telegram HTTP
     _tg_executor.submit(_tg_send, msg)
 
-def tg_notify_dtmf(number, key, account_email):
+def tg_notify_dtmf(number, key, account_email, contact_label=None):
+    label = contact_label if contact_label else number
     msg = (
-        f"🟢 PRESS {key} RECEIVED\n"
+        f"\U0001f7e2 PRESS {key} RECEIVED\n"
+        f"Contact: {label}\n"
         f"Number: {number}\n"
         f"Account: {account_email}"
     )
@@ -276,7 +347,7 @@ _PLAY_AUDIO_JS = """
 # control path unless the DTMF prompt-interrupt regression test is rerun.
 # ───────────────────────────────────────────────────────────────────────────────
 def play_audio_in_tab(driver, filepath, block=True, dtmf_interrupt=False,
-                       press1_filepath=None, number=None, account_email=None):
+                       press1_filepath=None, number=None, account_email=None, contact_label=None):
     """Inject and play audio directly into the GV WebRTC stream for this tab only.
     When dtmf_interrupt=True, a background thread watches window._gvDTMF.detected
     while the main thread waits for audio to finish. If a key is seen before the
@@ -349,7 +420,7 @@ def play_audio_in_tab(driver, filepath, block=True, dtmf_interrupt=False,
                     detected_key = dtmf_result[0]
                     log_msg(f"[audio][dtmf] Interrupting prompt for key '{detected_key}'", "success")
                     if number and account_email:
-                        tg_notify_dtmf(number, detected_key, account_email)
+                        tg_notify_dtmf(number, detected_key, account_email, contact_label=contact_label)
                     try:
                         driver.execute_script("""
                             if (window._gvAudioSrc) {
@@ -1374,7 +1445,7 @@ def _stop_dtmf_listen(driver):
         driver.execute_script("if(window._gvStopDTMF) window._gvStopDTMF();")
     except Exception: pass
 
-def _poll_for_dtmf(driver, timeout_s, number, account_email):
+def _poll_for_dtmf(driver, timeout_s, number, account_email, contact_label=None):
     """
     Poll for a DTMF keypress for up to timeout_s seconds.
     FIX #60: Only triggers on the configured dtmf_key_to_detect, not any key.
@@ -1393,7 +1464,7 @@ def _poll_for_dtmf(driver, timeout_s, number, account_email):
                 last_key = key
                 if key == key_to_detect:
                     log_msg(f"[dtmf] Key '{key}' received from {number}!", "success")
-                    tg_notify_dtmf(number, key, account_email)
+                    tg_notify_dtmf(number, key, account_email, contact_label=contact_label)
                     return key
                 else:
                     log_msg(f"[dtmf] Key '{key}' ignored (watching for '{key_to_detect}')", "info")
@@ -1513,27 +1584,31 @@ def _account_worker(account, num_queue, drivers, settings, lock):
                 break
             num = num_queue.get()
 
+        dial_num, contact_label = _unpack_entry(num)
+        _cdisplay = f" [{contact_label}]" if contact_label != dial_num else ""
+
         with lock:
-            state["current_number"]  = num
+            state["current_number"]  = dial_num
+            state["current_contact"] = contact_label
             state["current_account"] = email
 
-        log_msg(f"[{email}] → Dialing {num} ({state['completed']+state['failed']+1}/{state['total']})", "info")
-        debug_msg(f"worker={email} number={num} screen_hangup={screen_hangup} dtmf={dtmf_enabled} headless={settings.get('headless')}")
-        ok = make_call(driver, num, _account=account)
+        log_msg(f"[{email}] \u2192 Dialing {dial_num}{_cdisplay} ({state['completed']+state['failed']+1}/{state['total']})", "info")
+        debug_msg(f"worker={email} number={dial_num} screen_hangup={screen_hangup} dtmf={dtmf_enabled} headless={settings.get('headless')}")
+        ok = make_call(driver, dial_num, _account=account)
 
         if ok:
             call_type = getattr(driver, "_last_call_type", "unknown")
-            debug_msg(f"classified call {num} as {call_type}")
+            debug_msg(f"classified call {dial_num} as {call_type}")
             # FIX: respect vm_action dropdown ("hangup" | "message") instead of removed toggle
             vm_action_setting = settings.get("vm_action", "hangup")
             if call_type == "voicemail" and vm_enabled:
                 if vm_action_setting == "hangup":
-                    log_msg(f"[{email}] Voicemail detected — hanging up: {num}", "warning")
+                    log_msg(f"[{email}] Voicemail detected \u2014 hanging up: {dial_num}{_cdisplay}", "warning")
                     hang_up(driver)
                     with lock: state["failed"] += 1
                     time.sleep(3); continue
                 elif vm_action_setting == "message":
-                    log_msg(f"[{email}] Voicemail detected — leaving message: {num}", "warning")
+                    log_msg(f"[{email}] Voicemail detected \u2014 leaving message: {dial_num}{_cdisplay}", "warning")
                     # fall through to audio playback below to leave the voicemail message
 
             sc_action = settings.get("screen_hangup_action", "hangup")
@@ -1541,10 +1616,10 @@ def _account_worker(account, num_queue, drivers, settings, lock):
             if call_type == "screening" and screen_hangup:
                 if sc_action == "play_audio" and (audio_screen_bypass or audio_initial):
                     bypass_file = audio_screen_bypass if audio_screen_bypass else audio_initial
-                    log_msg(f"[{email}] Screen call detected — playing bypass audio to pass screener: {num}", "warning")
+                    log_msg(f"[{email}] Screen call detected \u2014 playing bypass audio to pass screener: {dial_num}{_cdisplay}", "warning")
                     time.sleep(0.5)
                     play_audio_in_tab(driver, bypass_file)
-                    debug_msg(f"[{email}] Bypass audio done — now waiting for human to accept screen call: {num}")
+                    debug_msg(f"[{email}] Bypass audio done \u2014 now waiting for human to accept screen call: {dial_num}")
 
                     # FIX: after bypass audio, the screener is still active.
                     # We must wait for the human to actually accept the screened call
@@ -1556,17 +1631,17 @@ def _account_worker(account, num_queue, drivers, settings, lock):
                         driver._last_call_type = post_screen_type
                         log_msg(f"[{email}] Post-screen pickup result: {post_screen_type}", "info")
                         if post_screen_type in ("no_answer", "voicemail"):
-                            log_msg(f"[{email}] Human did not accept screen call ({post_screen_type}) — hanging up: {num}", "warning")
+                            log_msg(f"[{email}] Human did not accept screen call ({post_screen_type}) \u2014 hanging up: {dial_num}{_cdisplay}", "warning")
                             hang_up(driver)
                             with lock: state["failed"] += 1
                             time.sleep(3); continue
                         # Human accepted — update call_type so DTMF path runs normally below
                         call_type = post_screen_type  # "human"
                     except Exception as _se:
-                        log_msg(f"[{email}] Post-screen wait error: {_se} — proceeding anyway", "warning")
+                        log_msg(f"[{email}] Post-screen wait error: {_se} \u2014 proceeding anyway", "warning")
                     # Do NOT set screening_handled=True — fall through so initial audio + DTMF runs
                 else:
-                    log_msg(f"[{email}] Screen call — hanging up: {num}", "warning")
+                    log_msg(f"[{email}] Screen call \u2014 hanging up: {dial_num}{_cdisplay}", "warning")
                     hang_up(driver)
                     with lock: state["failed"] += 1
                     time.sleep(3); continue
@@ -1581,11 +1656,12 @@ def _account_worker(account, num_queue, drivers, settings, lock):
                         block=True,
                         dtmf_interrupt=True,
                         press1_filepath=audio_press1 if audio_press1 else None,
-                        number=num,
-                        account_email=email
+                        number=dial_num,
+                        account_email=email,
+                        contact_label=contact_label
                     )
                     if dtmf_key:
-                        log_msg(f"[{email}] DTMF '{dtmf_key}' mid-audio for {num}", "success")
+                        log_msg(f"[{email}] DTMF '{dtmf_key}' mid-audio for {dial_num}{_cdisplay}", "success")
                 else:
                     play_audio_in_tab(driver, audio_initial)
 
@@ -1594,21 +1670,21 @@ def _account_worker(account, num_queue, drivers, settings, lock):
                 time.sleep(0.4)
                 # Play press1/goodbye audio fully before hanging up
                 if audio_press1 and os.path.exists(audio_press1):
-                    log_msg(f"[{email}] [audio] Playing press1 goodbye audio: {num}", "info")
+                    log_msg(f"[{email}] [audio] Playing press1 goodbye audio: {dial_num}{_cdisplay}", "info")
                     play_audio_in_tab(driver, audio_press1, block=True)
-                    log_msg(f"[{email}] Press1 audio done — hanging up: {num}", "info")
+                    log_msg(f"[{email}] Press1 audio done \u2014 hanging up: {dial_num}{_cdisplay}", "info")
                 else:
-                    log_msg(f"[{email}] DTMF confirmed, no press1 audio set — hanging up: {num}", "info")
+                    log_msg(f"[{email}] DTMF confirmed, no press1 audio set \u2014 hanging up: {dial_num}{_cdisplay}", "info")
             elif dtmf_enabled:
                 time.sleep(0.3)
                 log_msg(f"[{email}] [dtmf] Post-audio listen window {dtmf_timeout}s...", "info")
                 _start_dtmf_listen(driver)
-                dtmf_key = _poll_for_dtmf(driver, dtmf_timeout, num, email)
+                dtmf_key = _poll_for_dtmf(driver, dtmf_timeout, dial_num, email, contact_label=contact_label)
                 _stop_dtmf_listen(driver)
                 if dtmf_key and audio_press1:
                     play_audio_in_tab(driver, audio_press1, block=True)
             elif not audio_initial:
-                log_msg(f"[{email}] Call live — holding {delay}s...")
+                log_msg(f"[{email}] Call live \u2014 holding {delay}s...")
                 for _ in range(delay):
                     if state["_stop"]: break
                     time.sleep(1)
@@ -1617,10 +1693,10 @@ def _account_worker(account, num_queue, drivers, settings, lock):
             with lock:
                 state["completed"] += 1
                 pct = state["completed"] / state["total"] * 100
-            log_msg(f"[{email}] ✓ Done {num} — {state['completed']}/{state['total']} ({pct:.1f}%)", "success")
+            log_msg(f"[{email}] \u2713 Done {dial_num}{_cdisplay} \u2014 {state['completed']}/{state['total']} ({pct:.1f}%)", "success")
         else:
             with lock: state["failed"] += 1
-            log_msg(f"[{email}] ✗ Failed {num}", "error")
+            log_msg(f"[{email}] \u2717 Failed {dial_num}{_cdisplay}", "error")
 
     log_msg(f"[{email}] Worker done.", "info")
 
@@ -1647,9 +1723,9 @@ def campaign_worker():
         log_msg(f"[preflight] Initializing {acc['email']}...", "info")
         try:
             _drivers[key] = get_or_create_driver(acc)
-            log_msg(f"[preflight] ✓ {acc['email']} ready", "success")
+            log_msg(f"[preflight] \u2713 {acc['email']} ready", "success")
         except Exception as e:
-            log_msg(f"[preflight] ✗ {acc['email']} failed: {e}", "error")
+            log_msg(f"[preflight] \u2717 {acc['email']} failed: {e}", "error")
 
     ready = [a for a in active_accs if profile_name_for_account(a) in _drivers]
     if not ready:
@@ -1766,10 +1842,16 @@ def api_pause():
 
 @flask_app.route("/api/numbers/load", methods=["POST"])
 def api_load_numbers():
-    nums = [n.strip() for n in request.json.get("numbers", []) if n.strip()]
-    state.update({"numbers": nums, "total": len(nums), "completed": 0, "failed": 0})
-    with open(NUMBERS_F, "w") as f: f.write("\n".join(nums))
-    return jsonify({"message": f"Loaded {len(nums)} numbers"})
+    raw = request.json.get("numbers", [])
+    lines = [str(n).strip() for n in raw if str(n).strip()]
+    entries, skipped = _parse_contact_lines(lines)
+    state.update({"numbers": entries, "total": len(entries), "completed": 0, "failed": 0})
+    with open(NUMBERS_F, "w") as f:
+        f.write("\n".join(entries))
+    msg = f"Loaded {len(entries)} contact(s)"
+    if skipped:
+        msg += f" ({skipped} skipped \u2014 no valid number found)"
+    return jsonify({"message": msg})
 
 @flask_app.route("/api/numbers/clear", methods=["POST"])
 def api_clear():
@@ -2026,7 +2108,7 @@ def run_telegram_bot():
     if not token:
         return
     try:
-        from telegram.ext import ApplicationBuilder, CommandHandler
+        from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters as tg_filters
         import asyncio
 
         async def start_cmd(u, c):
@@ -2036,7 +2118,7 @@ def run_telegram_bot():
                 "/stop - stop campaign\n"
                 "/pause - pause/resume\n"
                 "/status - current stats\n"
-                "/addnumbers 555-555-0001,555-555-0002\n"
+                "/addnumbers [contacts] - add contacts inline or send blank to paste\n"
                 "/clearnumbers - clear queue"
             )
             await u.message.reply_text(msg)
@@ -2048,7 +2130,7 @@ def run_telegram_bot():
             state.update({"running": True, "_stop": False, "paused": False, "completed": 0, "failed": 0})
             threading.Thread(target=campaign_worker, daemon=True).start()
             debug_msg("telegram /call invoked")
-            await u.message.reply_text(f"Campaign started — {state['total']} numbers.")
+            await u.message.reply_text(f"Campaign started \u2014 {state['total']} numbers.")
 
         async def stop_cmd(u, c):
             state["_stop"] = True
@@ -2075,18 +2157,51 @@ def run_telegram_bot():
             await u.message.reply_text(msg)
 
         async def addnumbers_cmd(u, c):
-            raw = [n.strip() for arg in c.args for n in arg.split(',') if n.strip()]
-            existing = set(state["numbers"])
-            nums = []
-            seen = set()
-            for n in raw:
-                if n not in existing and n not in seen:
-                    nums.append(n)
-                    seen.add(n)
-            state["numbers"].extend(nums)
+            if c.args:
+                # Inline: treat full joined args as a single contact line
+                # (handles "+18315219699,Max Newton,android" format correctly)
+                full_line = ' '.join(c.args).strip()
+                entries, skipped = _parse_contact_lines([full_line])
+                if not entries:
+                    # Fallback: comma-separated bare numbers (backward compat)
+                    raw_lines = [n.strip() for n in full_line.split(',') if n.strip()]
+                    entries, skipped = _parse_contact_lines(raw_lines)
+                existing_nums = {_unpack_entry(e)[0] for e in state["numbers"]}
+                new_entries = [e for e in entries if _unpack_entry(e)[0] not in existing_nums]
+                state["numbers"].extend(new_entries)
+                state["total"] = len(state["numbers"])
+                msg = f"\u2705 Added {len(new_entries)} contact(s). Total: {state['total']}"
+                if skipped:
+                    msg += f" ({skipped} skipped)"
+                debug_msg(f"telegram /addnumbers inline added={len(new_entries)} total={state['total']}")
+                await u.message.reply_text(msg)
+            else:
+                # Two-step: prompt for paste
+                c.user_data['awaiting_contacts'] = True
+                await u.message.reply_text(
+                    "\U0001f4cb Paste your contacts / txt now.\n"
+                    "Accepts any format \u2014 one per line:\n"
+                    "+18315219699,Max Newton,android,...\n"
+                    "6316712632 ; email@x.com , [tag1|tag2]\n"
+                    "John Smith, (555) 123-4567, CEO\n"
+                    "5551234567"
+                )
+
+        async def on_plain_message(u, c):
+            if not c.user_data.get('awaiting_contacts'):
+                return
+            c.user_data['awaiting_contacts'] = False
+            raw_lines = (u.message.text or '').splitlines()
+            entries, skipped = _parse_contact_lines(raw_lines)
+            existing_nums = {_unpack_entry(e)[0] for e in state["numbers"]}
+            new_entries = [e for e in entries if _unpack_entry(e)[0] not in existing_nums]
+            state["numbers"].extend(new_entries)
             state["total"] = len(state["numbers"])
-            debug_msg(f"telegram /addnumbers added={len(nums)} total={state['total']}")
-            await u.message.reply_text(f"Added {len(nums)}. Total: {state['total']}")
+            msg = f"\u2705 Added {len(new_entries)} contact(s). Total: {state['total']}"
+            if skipped:
+                msg += f" ({skipped} skipped)"
+            debug_msg(f"telegram paste: added={len(new_entries)} total={state['total']}")
+            await u.message.reply_text(msg)
 
         async def clearnumbers_cmd(u, c):
             state.update({"numbers": [], "total": 0, "completed": 0, "failed": 0})
@@ -2105,6 +2220,7 @@ def run_telegram_bot():
             app.add_handler(CommandHandler("status", status_cmd))
             app.add_handler(CommandHandler("addnumbers", addnumbers_cmd))
             app.add_handler(CommandHandler("clearnumbers", clearnumbers_cmd))
+            app.add_handler(MessageHandler(tg_filters.TEXT & ~tg_filters.COMMAND, on_plain_message))
             await app.initialize()
             await app.start()
             await app.updater.start_polling()
