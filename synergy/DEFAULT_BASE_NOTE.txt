@@ -1,0 +1,9 @@
+DEFAULT BASE BUILD
+
+Use this fixed44 build as the starting point for future changes.
+Fixes included:
+- real Chromium launches use persistent backend/profiles/<profile>
+- Login button sends account email correctly
+- Login route again uses get_or_create_driver(account) so saved Settings credentials auto-fill login
+- UI JS syntax regression remains fixed
+- profiles directory path remains exposed in state/login responses
