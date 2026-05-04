@@ -100,10 +100,12 @@ def log_msg(msg, level="info"):
     if len(state["log"]) > 500:
         state["log"] = state["log"][-500:]
     logging.info(msg)
+    # FIX #19: verbose logic was inverted — only send error TG notify when NOT in verbose mode
     if level == "error" and not settings.get("verbose_debug", False):
         tg_notify(f"\u26a0\ufe0f ERROR\n{msg}")
 
 def debug_msg(msg):
+    # FIX #19: only log debug messages when verbose_debug IS enabled
     if settings.get("verbose_debug", False):
         log_msg(f"[debug] {msg}", "info")
 
@@ -814,13 +816,11 @@ def gv_login(driver, account):
 
     log_msg(f"Waiting for login: {account['email']} — complete 2FA in the browser", "warning")
     # FIX #20: Poll current_url only — do NOT call driver.get() here.
-    # Navigating away mid-auth breaks Google's OAuth flow.
     for _ in range(120):
         try:
             cur = driver.current_url
             if "challenge" in cur:
                 log_msg(f"Google login challenge for {account['email']} — complete manually once; session will persist after that", "warning")
-                # Keep polling — don't return False, let user complete challenge
             elif "voice.google.com" in cur and "accounts.google.com" not in cur:
                 log_msg(f"Login successful: {account['email']}", "success")
                 return True
@@ -838,9 +838,7 @@ def _is_driver_alive(driver):
     try: _ = driver.current_url; return True
     except Exception: return False
 
-
-def is_driver_alive(driver):
-    return _is_driver_alive(driver)
+# FIX #71: removed is_driver_alive() public alias — call _is_driver_alive() directly
 
 # FIX #5/#44: Deleted _profile_name_for() and profile_name() — both were divergent
 # duplicates with subtly different stripping logic, causing driver key mismatches.
@@ -996,8 +994,7 @@ def _dom_has(driver, selectors):
         except Exception: pass
     return False
 
-def dom_has(driver, selectors):
-    return _dom_has(driver, selectors)
+# FIX #70: removed dom_has() public alias — call _dom_has() directly
 
 def _get_call_timer(driver):
     try:
@@ -1016,8 +1013,7 @@ def _get_call_timer(driver):
     except Exception: pass
     return None
 
-def get_call_timer(driver):
-    return _get_call_timer(driver)
+# FIX #70: removed get_call_timer() public alias — call _get_call_timer() directly
 
 def _reset_classify(driver):
     try: driver.execute_script("if(window._gvStartClassify) window._gvStartClassify();")
@@ -1121,8 +1117,7 @@ def _wait_for_pickup_and_classify(driver):
             return _dom_classify(driver)
         time.sleep(0.15)
 
-def wait_for_pickup_and_classify(driver):
-    return _wait_for_pickup_and_classify(driver)
+# FIX #70: removed wait_for_pickup_and_classify() public alias — call _wait_for_pickup_and_classify() directly
 
 # ── DTMF polling ──────────────────────────────────────────────────────────────
 def _start_dtmf_listen(driver):
@@ -1142,7 +1137,6 @@ def _poll_for_dtmf(driver, timeout_s, number, account_email):
     FIX #60: Only triggers on the configured dtmf_key_to_detect, not any key.
     Returns the key string or None on timeout.
     """
-    # FIX #60: read the configured key to detect from live settings
     key_to_detect = str(settings.get("dtmf_key_to_detect", "1")).strip()
     log_msg(f"[dtmf] Listening for key '{key_to_detect}' ({timeout_s}s)...", "info")
     deadline = time.time() + timeout_s
@@ -1154,7 +1148,6 @@ def _poll_for_dtmf(driver, timeout_s, number, account_email):
             if dtmf and dtmf.get("detected") and dtmf["detected"] != last_key:
                 key = dtmf["detected"]
                 last_key = key
-                # FIX #60: filter — only act on the configured key
                 if key == key_to_detect:
                     log_msg(f"[dtmf] Key '{key}' received from {number}!", "success")
                     tg_notify_dtmf(number, key, account_email)
@@ -1215,13 +1208,11 @@ def make_call(driver, number, _account=None, _retry=False, _depth=0):
                 if debug: log_msg(f"[call] Debug info: {debug[:10]}", "warning")
                 log_msg(f"[call] Dial error: {err} — {number}", "error"); return False
             if result is True:
-                # FIX #58: start ring timer now — call is confirmed connected
                 ring_start = time.time()
                 break
             time.sleep(0.2)
         else:
             log_msg(f"[call] Dial timed out: {number}", "error"); return False
-        # store total ring time in ms on the driver so classifier can use it
         try:
             driver._last_ring_ms = max(0, int((time.time() - ring_start) * 1000)) if ring_start else None
         except Exception:
@@ -1286,16 +1277,12 @@ def _account_worker(account, num_queue, drivers, settings, lock):
         if ok:
             call_type = getattr(driver, "_last_call_type", "unknown")
             debug_msg(f"classified call {num} as {call_type}")
-            # Voicemail hangup
             if call_type == "voicemail" and vm_enabled and vm_hangup:
                 log_msg(f"[{email}] Voicemail — skipping {num}", "warning")
                 hang_up(driver)
                 with lock: state["failed"] += 1
                 time.sleep(3); continue
 
-            # FIX #21: Screen call handling — only play audio if call is connected
-            # call_type will be "screening" only after make_call() returned True,
-            # which means _gvDialResult==true and pickup confirmed. Safe to play.
             sc_action = settings.get("screen_hangup_action", "hangup")
             if call_type == "screening" and screen_hangup:
                 if sc_action == "play_audio" and audio_screen_bypass:
@@ -1318,9 +1305,6 @@ def _account_worker(account, num_queue, drivers, settings, lock):
                 log_msg(f"[{email}] [audio] Playing initial message...", "info")
                 time.sleep(1)
                 if dtmf_enabled:
-                    # DTMF monitored DURING audio — cuts short if press1 detected.
-                    # FIX #25: play_audio_in_tab already plays press1_filepath internally
-                    # on DTMF interrupt. Do NOT play press1 again after this returns.
                     dtmf_key = play_audio_in_tab(
                         driver, audio_initial,
                         block=True,
@@ -1334,8 +1318,6 @@ def _account_worker(account, num_queue, drivers, settings, lock):
                 else:
                     play_audio_in_tab(driver, audio_initial)
 
-            # FIX #25: If dtmf_key was caught mid-audio, press1 was ALREADY played
-            # inside play_audio_in_tab() via press1_filepath. Do not play it again here.
             if dtmf_key:
                 log_msg(f"[{email}] DTMF mid-audio confirmed — press1 already honored, hanging up now", "info")
             elif dtmf_enabled:
@@ -1344,7 +1326,6 @@ def _account_worker(account, num_queue, drivers, settings, lock):
                 _start_dtmf_listen(driver)
                 dtmf_key = _poll_for_dtmf(driver, dtmf_timeout, num, email)
                 _stop_dtmf_listen(driver)
-                # FIX #25: Only play press1 here if caught in POST-audio window (not mid-audio)
                 if dtmf_key and audio_press1:
                     play_audio_in_tab(driver, audio_press1, block=True)
             elif not audio_initial:
@@ -1546,7 +1527,6 @@ def api_save_settings():
         if not isinstance(payload_accounts, list):
             payload_accounts = []
 
-        # FIX #55: preserve existing password if UI sends *** (redacted placeholder)
         existing_accounts = {a.get("email"): a for a in settings.get("accounts", [])}
 
         normalized_accounts = []
@@ -1555,13 +1535,11 @@ def api_save_settings():
                 continue
             email = str(a.get("email", "") or "").strip()
             incoming_pw = str(a.get("password", "") or "")
-            # If the UI sent back the redacted placeholder, keep the real stored password
             if incoming_pw == "***" and email in existing_accounts:
                 password = existing_accounts[email].get("password", "")
             else:
                 password = incoming_pw
 
-            # FIX #55: preserve existing profile name; only auto-assign if field was never set
             existing_profile = existing_accounts.get(email, {}).get("profile", "")
             incoming_profile = str(a.get("profile", "") or "").strip()
             if incoming_profile:
@@ -1577,7 +1555,6 @@ def api_save_settings():
                 "profile": profile,
             })
 
-        # FIX #65: clamp concurrent_limit to sane max of 10
         concurrent = int(payload.get("concurrent_limit", 1))
         if concurrent > 10:
             log_msg(f"[settings] concurrent_limit clamped from {concurrent} to 10", "warning")
@@ -1614,14 +1591,12 @@ def api_test_call():
                 call_type = getattr(d, "_last_call_type", "unknown")
                 audio_bypass = s.get("audio_screen_bypass", "")
                 audio_initial = s.get("audio_initial", "")
-                # FIX #42: Only play screening audio if call is confirmed connected (ok==True)
                 if call_type == "screening" and s.get("screen_hangup_enabled") and s.get("screen_hangup_action") == "play_audio" and audio_bypass:
                     log_msg(f"[test] Screen call detected — playing BYPASS audio: {number}", "warning")
                     play_audio_in_tab(d, audio_bypass)
                 key = None
                 if audio_initial:
                     if s.get("dtmf_enabled"):
-                        # FIX #25: press1 plays inside play_audio_in_tab on interrupt — not again below
                         key = play_audio_in_tab(
                             d, audio_initial,
                             block=True,
@@ -1636,10 +1611,9 @@ def api_test_call():
                     _start_dtmf_listen(d)
                     key = _poll_for_dtmf(d, int(s.get("dtmf_timeout", 20)), number, account["email"])
                     _stop_dtmf_listen(d)
-                    # Only play press1 here for post-audio window catch
                     if key and s.get("audio_press1"):
                         play_audio_in_tab(d, s["audio_press1"])
-                # FIX #63: always hang up immediately in test call — skip delay sleep
+                # FIX #63: always hang up immediately in test call
                 hang_up(d)
             log_msg(f"Test call to {number} complete", "success")
         except Exception as e:
@@ -1702,7 +1676,7 @@ def api_audio_status():
 
 @flask_app.route("/api/kill_browsers", methods=["POST"])
 def api_kill_browsers():
-    # FIX #59: removed redundant per-request import of subprocess/sys — already imported at top
+    # FIX #59: removed redundant per-request import of subprocess/sys
     killed = []
     targets = ["chromium", "chromium-browser", "chrome", "chromedriver"]
     try:
@@ -1819,7 +1793,6 @@ def run_telegram_bot():
             await u.message.reply_text("Queue cleared.")
 
         async def main():
-            # FIX #57: use fresh token at bot startup
             live_token = _get_token()
             app = ApplicationBuilder().token(live_token).build()
             app.add_handler(CommandHandler("start", start_cmd))
