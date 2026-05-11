@@ -316,6 +316,7 @@ code{background:var(--surface2);border:1px solid var(--border);border-radius:3px
       <div class="stat"><div class="stat-lbl">queued</div><div class="stat-val" id="st-total">0</div></div>
       <div class="stat"><div class="stat-lbl">dialed</div><div class="stat-val green" id="st-done">0</div></div>
       <div class="stat"><div class="stat-lbl">failed</div><div class="stat-val red" id="st-fail">0</div></div>
+      <div class="stat"><div class="stat-lbl">voicemail</div><div class="stat-val" id="st-vm" style="color:var(--yellow)">0</div></div>
       <div class="stat"><div class="stat-lbl">progress</div><div class="stat-val" id="st-pct">0%</div></div>
     </div>
 
@@ -722,6 +723,7 @@ async function poll() {
     document.getElementById('st-total').textContent = d.total || 0;
     document.getElementById('st-done').textContent  = d.completed || 0;
     document.getElementById('st-fail').textContent  = d.failed || 0;
+        if(document.getElementById('st-vm')) document.getElementById('st-vm').textContent = d.vm || 0;
     document.getElementById('st-pct').textContent   = pct + '%';
     document.getElementById('ns-q').textContent     = d.total || 0;
     document.getElementById('ns-d').textContent     = d.completed || 0;
