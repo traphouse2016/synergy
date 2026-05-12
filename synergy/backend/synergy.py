@@ -1340,21 +1340,27 @@ def _classify_audio_on_silence(cs):
     if total_speech == 0:
         return "dom_fallback"
 
-    # Long unbroken monologue = voicemail greeting (or screener closing message)
+    # Long unbroken monologue = voicemail greeting
     if max_burst >= _VM_MAXBURST_MS:
         return "voicemail"
 
-    # Short first burst (< 900ms) + little total speech = human "Hello?"
-    if first_burst <= _HUMAN_FIRST_BURST_MS and total_speech < 1200:
+    # Many short choppy phrases = screener reading a script (e.g. Google screener)
+    # A real human "Hello?" is 1-3 phrases max before waiting.
+    # 5+ phrases with any meaningful total speech = screener, not human.
+    if phrase_count >= 5 and total_speech >= 800:
+        return "screening"
+
+    # High total speech with multiple phrases = screener talking at length
+    if phrase_count >= 3 and total_speech >= 2000:
+        return "screening"
+
+    # Short first burst + few phrases + little total speech = human "Hello?"
+    if first_burst <= _HUMAN_FIRST_BURST_MS and total_speech < 1500 and phrase_count <= 3:
         return "human"
 
     # Medium-to-long first burst (900ms – 3500ms) = screener asking a question
     if _SCREEN_SPEECH_MS <= first_burst < _VM_MAXBURST_MS:
         return "screening"
-
-    # Multiple phrases, none long enough for VM = human conversation
-    if phrase_count >= 2 and max_burst < _VM_MAXBURST_MS:
-        return "human"
 
     # Ambiguous — let DOM decide
     return "dom_fallback"
