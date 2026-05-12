@@ -527,7 +527,11 @@ _WEBAUDIO_HOOK = r"""
     connected: false, classifying: false,
     totalSpeechMs: 0, silenceMs: 0,
     energy: 0, burstMs: 0, maxBurstMs: 0,
-    phraseCount: 0, inSpeech: false
+    phraseCount: 0, inSpeech: false,
+    // silence-triggered classification fields
+    firstBurstMs: 0, firstBurstLocked: false,
+    currentBurstMs: 0, silenceAfterFirst: 0,
+    consecutiveSilenceMs: 0, speechStarted: false
   };
 
   window._gvStartClassify = function() {
@@ -536,6 +540,10 @@ _WEBAUDIO_HOOK = r"""
     s.burstMs = 0; s.maxBurstMs = 0;
     s.phraseCount = 0; s.inSpeech = false;
     s.classifying = true;
+    // reset silence-trigger fields
+    s.firstBurstMs = 0; s.firstBurstLocked = false;
+    s.currentBurstMs = 0; s.silenceAfterFirst = 0;
+    s.consecutiveSilenceMs = 0; s.speechStarted = false;
   };
 
   window._gvDTMF = { detected: null, detectedAt: 0, history: [], listening: false };
@@ -588,13 +596,24 @@ _WEBAUDIO_HOOK = r"""
         if (!window._gvCallState.classifying) return;
         var s = window._gvCallState;
         if (rms > THRESH) {
-          s.totalSpeechMs += TICK; s.burstMs += TICK;
+          s.totalSpeechMs += TICK;
+          s.currentBurstMs += TICK;
+          s.burstMs += TICK;
+          s.consecutiveSilenceMs = 0;
+          s.speechStarted = true;
           if (s.burstMs > s.maxBurstMs) s.maxBurstMs = s.burstMs;
+          if (!s.firstBurstLocked) s.firstBurstMs = s.currentBurstMs;
           if (!s.inSpeech) { s.inSpeech = true; s.phraseCount++; }
         } else {
           s.silenceMs += TICK;
-          if (s.inSpeech) s.inSpeech = false;
+          s.consecutiveSilenceMs += TICK;
+          if (s.speechStarted) s.silenceAfterFirst += TICK;
+          if (s.inSpeech) {
+            s.inSpeech = false;
+            s.firstBurstLocked = true;  // first burst has ended — lock it
+          }
           s.burstMs = 0;
+          s.currentBurstMs = 0;
         }
       }, TICK);
 
@@ -913,16 +932,30 @@ def release_drivers():
     _drivers.clear()
 
 # ── VM / screening detection ──────────────────────────────────────────────────
-_VM_MAXBURST_MS    = 3500
-_SCREEN_SPEECH_MS  = 2000
-_HUMAN_SPEECH_MS   = 1500
-_PICKUP_TIMEOUT_S  = 55
-_CLASSIFY_WINDOW_S = 9
-_SEL_ENDED         = ["[aria-label*='Call ended' i]"]
-_VM_PHRASES        = ["leave a message", "after the beep", "record your message",
-                      "not available", "please leave", "sorry", "unavailable",
-                      "please try again", "not able to come to the phone",
-                      "cannot take your call", "is not available"]
+_VM_MAXBURST_MS       = 3500   # ms continuous burst = voicemail monologue
+_SCREEN_SPEECH_MS     = 1000   # ms first burst = screener question
+_HUMAN_FIRST_BURST_MS = 900    # ms first burst ceiling = human "Hello?"
+_SILENCE_TO_CLASSIFY  = 1800   # ms consecutive silence = caller done speaking
+_SILENCE_AFTER_AUDIO  = 2000   # ms silence to wait before playing bypass audio
+_PICKUP_TIMEOUT_S     = 55
+_SEL_ENDED            = ["[aria-label*='Call ended' i]"]
+
+_VM_PHRASES = [
+    "leave a message", "after the beep", "record your message",
+    "not available", "please leave", "sorry", "unavailable",
+    "please try again", "not able to come to the phone",
+    "cannot take your call", "is not available",
+    "voicemail", "leave a detailed message",
+]
+
+_SCREEN_PHRASES = [
+    "call assistant", "google call screening", "screening your call",
+    "state your name", "reason for calling", "who's calling",
+    "who is calling", "what's this regarding", "what is this regarding",
+    "i can connect you", "i'll let them know", "let them know you called",
+    "handle calls", "i'm a google assistant", "call screener",
+    "screen your calls", "asking for",
+]
 
 
 def get_driver(profile_name, headless=False):
@@ -1178,16 +1211,30 @@ def hang_up(driver):
 
 
 # ── VM / screening detection ──────────────────────────────────────────────────
-_VM_MAXBURST_MS    = 3500
-_SCREEN_SPEECH_MS  = 2000
-_HUMAN_SPEECH_MS   = 1500
-_PICKUP_TIMEOUT_S  = 55
-_CLASSIFY_WINDOW_S = 9
-_SEL_ENDED         = ["[aria-label*='Call ended' i]"]
-_VM_PHRASES        = ["leave a message", "after the beep", "record your message",
-                      "not available", "please leave", "sorry", "unavailable",
-                      "please try again", "not able to come to the phone",
-                      "cannot take your call", "is not available"]
+_VM_MAXBURST_MS       = 3500   # ms continuous burst = voicemail monologue
+_SCREEN_SPEECH_MS     = 1000   # ms first burst = screener question
+_HUMAN_FIRST_BURST_MS = 900    # ms first burst ceiling = human "Hello?"
+_SILENCE_TO_CLASSIFY  = 1800   # ms consecutive silence = caller done speaking
+_SILENCE_AFTER_AUDIO  = 2000   # ms silence to wait before playing bypass audio
+_PICKUP_TIMEOUT_S     = 55
+_SEL_ENDED            = ["[aria-label*='Call ended' i]"]
+
+_VM_PHRASES = [
+    "leave a message", "after the beep", "record your message",
+    "not available", "please leave", "sorry", "unavailable",
+    "please try again", "not able to come to the phone",
+    "cannot take your call", "is not available",
+    "voicemail", "leave a detailed message",
+]
+
+_SCREEN_PHRASES = [
+    "call assistant", "google call screening", "screening your call",
+    "state your name", "reason for calling", "who's calling",
+    "who is calling", "what's this regarding", "what is this regarding",
+    "i can connect you", "i'll let them know", "let them know you called",
+    "handle calls", "i'm a google assistant", "call screener",
+    "screen your calls", "asking for",
+]
 
 def _dom_has(driver, selectors):
     for sel in selectors:
@@ -1231,13 +1278,15 @@ def _get_call_state(driver):
 # Alias used throughout classify paths
 _get_call_state_safe = _get_call_state
 
-def _dom_classify(driver):
-    """FIX #62: use Shadow DOM traversal via CDP Runtime.evaluate with pierce to find VM phrases."""
+def _dom_classify(driver, check_screen=True):
+    """Shadow DOM traversal to detect VM or screener phrases.
+    Returns 'voicemail', 'screening', or 'human'."""
     try:
         result = driver.execute_cdp_cmd("Runtime.evaluate", {
             "expression": """
                 (function() {
-                  var phrases = """ + json.dumps(_VM_PHRASES) + """;
+                  var vmPhrases = """ + json.dumps(_VM_PHRASES) + """;
+                  var screenPhrases = """ + json.dumps(_SCREEN_PHRASES) + """;
                   function getText(root) {
                     var text = '';
                     try { text += (root.innerText || root.textContent || '').toLowerCase(); } catch(e) {}
@@ -1248,8 +1297,11 @@ def _dom_classify(driver):
                     return text;
                   }
                   var fullText = getText(document);
-                  for (var p = 0; p < phrases.length; p++) {
-                    if (fullText.indexOf(phrases[p]) !== -1) return 'voicemail';
+                  for (var p = 0; p < vmPhrases.length; p++) {
+                    if (fullText.indexOf(vmPhrases[p]) !== -1) return 'voicemail';
+                  }
+                  for (var s = 0; s < screenPhrases.length; s++) {
+                    if (fullText.indexOf(screenPhrases[s]) !== -1) return 'screening';
                   }
                   return 'human';
                 })()
@@ -1269,170 +1321,233 @@ def _dom_classify(driver):
     if not scope:
         try: scope = driver.page_source.lower()
         except Exception: pass
-    if any(p in scope for p in _VM_PHRASES): return "voicemail"
+    if any(p in scope for p in _VM_PHRASES):    return "voicemail"
+    if check_screen and any(p in scope for p in _SCREEN_PHRASES): return "screening"
     return "human"
 
-def _classify_audio(cs, elapsed_ms):
+def _classify_audio_on_silence(cs):
+    """
+    Called ONLY after consecutive silence >= _SILENCE_TO_CLASSIFY ms.
+    Uses the firstBurstMs (locked at end of first phrase) as primary signal.
+    Returns: 'voicemail' | 'screening' | 'human' | 'dom_fallback'
+    """
+    first_burst  = cs.get("firstBurstMs", 0)
     max_burst    = cs.get("maxBurstMs", 0)
     total_speech = cs.get("totalSpeechMs", 0)
-    if max_burst >= _VM_MAXBURST_MS:                             return "voicemail"
-    if total_speech >= _SCREEN_SPEECH_MS and max_burst < _VM_MAXBURST_MS: return "screening"
-    if elapsed_ms >= 4000 and 100 < total_speech < _HUMAN_SPEECH_MS:      return "human"
-    if elapsed_ms >= (_CLASSIFY_WINDOW_S * 1000):
-        if total_speech == 0:                  return "dom_fallback"
-        if total_speech >= _SCREEN_SPEECH_MS:  return "screening"
-        if max_burst >= _VM_MAXBURST_MS:       return "voicemail"
+    phrase_count = cs.get("phraseCount", 0)
+
+    # No speech heard at all → DOM is the only option
+    if total_speech == 0:
+        return "dom_fallback"
+
+    # Long unbroken monologue = voicemail greeting (or screener closing message)
+    if max_burst >= _VM_MAXBURST_MS:
+        return "voicemail"
+
+    # Short first burst (< 900ms) + little total speech = human "Hello?"
+    if first_burst <= _HUMAN_FIRST_BURST_MS and total_speech < 1200:
         return "human"
-    return None
+
+    # Medium-to-long first burst (900ms – 3500ms) = screener asking a question
+    if _SCREEN_SPEECH_MS <= first_burst < _VM_MAXBURST_MS:
+        return "screening"
+
+    # Multiple phrases, none long enough for VM = human conversation
+    if phrase_count >= 2 and max_burst < _VM_MAXBURST_MS:
+        return "human"
+
+    # Ambiguous — let DOM decide
+    return "dom_fallback"
+
+
+# Keep old name as thin shim so nothing else breaks
+def _classify_audio(cs, elapsed_ms):
+    """Legacy shim — new code uses _classify_audio_on_silence via _wait_for_pickup_and_classify."""
+    return _classify_audio_on_silence(cs)
+
+def _wait_for_silence(driver, silence_needed_ms=1800, timeout_s=35, label=""):
+    """
+    Block until consecutive audio silence >= silence_needed_ms OR call ends.
+    Returns True when silence achieved, False on call end or timeout.
+    Ensures bypass audio is NEVER played while the caller/screener is still talking.
+    """
+    deadline     = time.time() + timeout_s
+    _last_warn   = 0.0
+    while time.time() < deadline:
+        if _dom_has(driver, _SEL_ENDED):
+            log_msg(f"[vm] {label}silence-wait: call ended", "info")
+            return False
+        try:
+            consec = driver.execute_script(
+                "return (window._gvCallState && window._gvCallState.consecutiveSilenceMs != null)"
+                " ? window._gvCallState.consecutiveSilenceMs : -1;"
+            )
+        except Exception:
+            consec = -1
+        if consec >= silence_needed_ms:
+            log_msg(f"[vm] {label}silence achieved ({consec:.0f}ms) — proceeding", "info")
+            return True
+        # throttled log: every 5s remind us we're still waiting
+        now = time.time()
+        if now - _last_warn >= 5.0:
+            log_msg(f"[vm] {label}still waiting for silence... ({consec:.0f}ms / {silence_needed_ms}ms)", "info")
+            _last_warn = now
+        time.sleep(0.08)
+    log_msg(f"[vm] {label}silence timeout after {timeout_s}s — forcing classify", "warning")
+    return True   # timeout: attempt classification anyway
+
 
 def _classify_post_screen(driver):
     """
-    Called immediately after bypass audio finishes playing.
-    Waits for screener silence (2s), then quickly classifies human/voicemail.
-    Tight timing so 'Press 1' prompt starts fast after bypass ends.
+    Called after screener detection.
+    Step 1: wait for screener to go fully silent (up to 35s — screener monologue can be 4-15s).
+    Step 2: reset classifier, wait for human response OR more audio.
+    Step 3: silence-triggered classification.
+    Human NEVER hears bypass audio during the screener's message.
     """
-    log_msg("[vm] Post-screen: waiting for screener silence...", "info")
+    log_msg("[vm] Post-screen: waiting for screener to finish speaking...", "info")
 
-    # Phase 1 — wait for screener to go silent (up to 12s)
-    silence_start = None
-    SILENCE_NEEDED = 2.0   # 2s continuous silence = screener done
-    PHASE1_LIMIT   = 12.0
-    phase1_start   = time.time()
-
-    while True:
-        if _dom_has(driver, _SEL_ENDED):
-            log_msg("[vm] Post-screen: call ended during screener wait", "info")
-            return "no_answer"
-        if (time.time() - phase1_start) > PHASE1_LIMIT:
-            log_msg("[vm] Post-screen: screener never went silent — returning no_answer", "warning")
-            return "no_answer"
-        try:
-            energy = driver.execute_script(
-                "return (window._gvCallState && window._gvCallState.energy != null)"
-                " ? window._gvCallState.energy : -1;"
-            )
-        except Exception:
-            energy = -1
-
-        if energy >= 0 and energy < 0.008:
-            if silence_start is None:
-                silence_start = time.time()
-            elif (time.time() - silence_start) >= SILENCE_NEEDED:
-                log_msg("[vm] Post-screen: screener silent — classifying pickup", "info")
-                break
-        else:
-            silence_start = None
-        time.sleep(0.08)
-
+    # ── Phase 1: wait for screener to stop talking ──────────────────────────
+    ok = _wait_for_silence(driver, silence_needed_ms=_SILENCE_AFTER_AUDIO,
+                           timeout_s=35, label="post-screen P1 ")
+    if not ok:
+        return "no_answer"
     if _dom_has(driver, _SEL_ENDED):
         return "no_answer"
 
-    # Phase 2 — reset classifier and listen for 4s
+    log_msg("[vm] Post-screen: screener done — ready for human response", "info")
+
+    # ── Phase 2: reset + wait for human to respond or stay silent ──────────
     _reset_classify(driver)
     classify_start = time.time()
+    RESPONSE_TIMEOUT = 12.0   # if nobody speaks within 12s after screener → no_answer
 
     while True:
         if _dom_has(driver, _SEL_ENDED):
-            log_msg("[vm] Post-screen: call ended — no human pickup", "info")
+            log_msg("[vm] Post-screen: call ended during response wait", "info")
             return "no_answer"
 
-        elapsed_ms = (time.time() - classify_start) * 1000
+        elapsed = time.time() - classify_start
         cs = _get_call_state(driver)
 
         if cs:
-            max_burst    = cs.get("maxBurstMs",    0)
-            total_speech = cs.get("totalSpeechMs", 0)
+            consec_sil = cs.get("consecutiveSilenceMs", 0)
+            speech     = cs.get("speechStarted", False)
+            total_sp   = cs.get("totalSpeechMs", 0)
+            max_burst  = cs.get("maxBurstMs", 0)
 
-            # Voicemail: long unbroken greeting
-            if max_burst >= _VM_MAXBURST_MS:
-                log_msg(f"[vm] Post-screen: voicemail (burst={max_burst}ms)", "info")
-                return "voicemail"
-
-            # Human: real speech burst, not a VM monologue
-            # Lower threshold than initial classify — post-screen humans speak briefly
-            if elapsed_ms >= 2000 and total_speech >= 300 and max_burst < _VM_MAXBURST_MS:
+            # If speech has started and then gone silent again → classify now
+            if speech and consec_sil >= _SILENCE_TO_CLASSIFY:
+                result = _classify_audio_on_silence(cs)
+                if result == "dom_fallback":
+                    result = _dom_classify(driver)
                 log_msg(
-                    f"[vm] Post-screen: human accepted "
-                    f"(speech={total_speech}ms burst={max_burst}ms elapsed={elapsed_ms:.0f}ms)",
+                    f"[vm] Post-screen result: {result} "
+                    f"(speech={total_sp}ms burst={max_burst}ms "
+                    f"elapsed={elapsed*1000:.0f}ms)",
                     "info"
                 )
-                return "human"
+                return result
 
-        # 10s silence after screener done = nobody accepted
-        if elapsed_ms >= 10000:
+            # VM monologue detected mid-stream — don't wait for full silence
+            if max_burst >= _VM_MAXBURST_MS:
+                log_msg(f"[vm] Post-screen: voicemail burst mid-stream ({max_burst}ms)", "info")
+                return "voicemail"
+
+        # Nobody spoke within response timeout → no_answer
+        if elapsed >= RESPONSE_TIMEOUT:
+            # Final DOM check
             dom = _dom_classify(driver)
-            log_msg(f"[vm] Post-screen: timeout, dom={dom}", "info")
-            return dom if dom else "no_answer"
+            log_msg(f"[vm] Post-screen: response timeout → {dom}", "info")
+            return dom if dom != "human" else "no_answer"
 
         time.sleep(0.08)
 
 
 def _wait_for_pickup_and_classify(driver):
+    """
+    Wait for call timer (pickup confirmed), then use silence-triggered
+    classification. Never classifies mid-sentence.
+    """
     log_msg("[vm] Waiting for pickup...", "info")
     deadline = time.time() + _PICKUP_TIMEOUT_S
     while time.time() < deadline:
         if _dom_has(driver, _SEL_ENDED): return "no_answer"
-        if _get_call_timer(driver): break
+        if _get_call_timer(driver):      break
         time.sleep(0.15)
     else:
         return "no_answer"
-    log_msg("[vm] Classifying call...", "info")
-    # FIX: compute ring_ms (time from ring-confirmed to pickup) now that timer appeared
-    # Screen calls fire at 1-4s after ring; VMs that pass through as "screening" ring much longer
-    _pickup_ring_ms = None
+
+    # Log ring duration
     try:
         _ring_start = getattr(driver, "_ring_start_time", None)
-        _pickup_ring_ms = int((time.time() - _ring_start) * 1000) if _ring_start else None
-        if _pickup_ring_ms is not None:
-            log_msg(f"[vm] Ring duration before pickup: {_pickup_ring_ms}ms", "info")
+        ring_ms = int((time.time() - _ring_start) * 1000) if _ring_start else None
+        if ring_ms is not None:
+            log_msg(f"[vm] Ring duration before pickup: {ring_ms}ms", "info")
     except Exception:
-        _pickup_ring_ms = None
-    driver._last_ring_ms = _pickup_ring_ms  # FIX 9: always reset unconditionally
+        ring_ms = None
+    driver._last_ring_ms = ring_ms
+
+    log_msg("[vm] Pickup confirmed — classifying (silence-triggered)...", "info")
     _reset_classify(driver)
+
+    # ── Wait for first silence after speech starts ──────────────────────────
+    # This ensures we never classify mid-sentence (screener still talking, VM
+    # still playing its greeting, or human still saying their first "Hello?")
     classify_start = time.time()
-    # FIX #35: classified flag — only fire dom_fallback once per call
-    _classified = False
+    CLASSIFY_HARD_TIMEOUT = 25.0  # absolute ceiling in case silence never comes
+
     while True:
         if _dom_has(driver, _SEL_ENDED): return "no_answer"
-        elapsed_ms = (time.time() - classify_start) * 1000
-        cs = _get_call_state(driver)
+
+        elapsed = time.time() - classify_start
+        cs      = _get_call_state(driver)
+
         if cs and cs.get("classifying"):
-            result = _classify_audio(cs, elapsed_ms)
-            if result == "dom_fallback" and not _classified:
-                _classified = True
-                return _dom_classify(driver)
-            if result is not None and result != "dom_fallback":
-                # _pickup_ring_ms was computed at pickup detection above (fix)
-                _cur_ring_ms = _pickup_ring_ms if _pickup_ring_ms is not None else getattr(driver, "_last_ring_ms", None)
-                log_msg(f"[vm] Result: {result} "
-                        f"(speech={cs.get('totalSpeechMs',0)}ms "
-                        f"burst={cs.get('maxBurstMs',0)}ms "
-                        f"ring={_cur_ring_ms}ms)", "info")
-                # FIX: screen calls only fire 1-4s after ring starts.
-                # If rang >=5s before pickup it's a VM misclassified as screening.
-                if result == "screening" and _cur_ring_ms is not None and _cur_ring_ms >= 5000:
-                    log_msg(f"[vm] Auto-upgrading screening→voicemail: rang {_cur_ring_ms}ms before pickup (screen calls trigger at 1-4s only)", "info")
-                    result = "voicemail"
-                # FIX: human detection guard — if audio said "human" but call
-                # rang 8+ seconds before pickup, run DOM phrase check first.
-                # Real humans answer in 1-4 rings (~4-15s). Short VMs like
-                # "Hi, unavailable" can fool the audio analyser at low speech ms.
-                # DOM check is cheap and definitive.
-                if result == "human" and _cur_ring_ms is not None and _cur_ring_ms >= 8000:
-                    dom_check = _dom_classify(driver)
-                    if dom_check == "voicemail":
-                        log_msg(f"[vm] Audio=human but DOM=voicemail (ring={_cur_ring_ms}ms) — upgrading to voicemail", "info")
-                        result = "voicemail"
-                    else:
-                        log_msg(f"[vm] Audio=human, DOM=human confirmed (ring={_cur_ring_ms}ms)", "info")
+            consec_sil  = cs.get("consecutiveSilenceMs", 0)
+            speech_seen = cs.get("speechStarted", False)
+            max_burst   = cs.get("maxBurstMs", 0)
+
+            # VM monologue detected inline — no need to wait for full silence
+            if max_burst >= _VM_MAXBURST_MS:
+                dom_confirm = _dom_classify(driver)
+                result = "voicemail" if dom_confirm == "voicemail" else "voicemail"
+                log_msg(
+                    f"[vm] Result: voicemail (burst={max_burst}ms ring={ring_ms}ms)",
+                    "info"
+                )
                 return result
-        if elapsed_ms > (_CLASSIFY_WINDOW_S * 1000) + 1000 and not _classified:
-            _classified = True
-            return _dom_classify(driver)
-        time.sleep(0.15)
 
-# FIX #70: removed wait_for_pickup_and_classify() public alias — call _wait_for_pickup_and_classify() directly
+            # Silence achieved after speech — ready to classify
+            if speech_seen and consec_sil >= _SILENCE_TO_CLASSIFY:
+                result = _classify_audio_on_silence(cs)
+                if result == "dom_fallback":
+                    result = _dom_classify(driver)
+                log_msg(
+                    f"[vm] Result: {result} "
+                    f"(speech={cs.get('totalSpeechMs',0)}ms "
+                    f"firstBurst={cs.get('firstBurstMs',0)}ms "
+                    f"maxBurst={max_burst}ms ring={ring_ms}ms)",
+                    "info"
+                )
+                # Always confirm human/screening against DOM
+                if result in ("human", "screening"):
+                    dom = _dom_classify(driver)
+                    if dom == "voicemail":
+                        log_msg(
+                            f"[vm] Audio={result} but DOM=voicemail — upgrading",
+                            "info"
+                        )
+                        return "voicemail"
+                return result
 
+        # Hard timeout — nobody spoke or silence never came
+        if elapsed >= CLASSIFY_HARD_TIMEOUT:
+            dom = _dom_classify(driver)
+            log_msg(f"[vm] Classify timeout → {dom} (ring={ring_ms}ms)", "warning")
+            return dom
+
+        time.sleep(0.08)
 
 
 def classify_call(driver, classify_seconds=8):
@@ -1636,15 +1751,43 @@ def _account_worker(account, num_queue, lock):
                 time.sleep(3)
                 verdict = classify_call(driver)
                 debug_msg(f"screen verdict={verdict} for {num}")
-                if verdict == "voicemail":
-                    log_msg(f"[{email}] Screen: voicemail detected — {screen_action}", "info")
-                    if screen_action == "play_audio" and audio_screen:
-                        play_audio_in_tab(driver, audio_screen)
-                    hang_up(driver)
-                    with lock:
-                        state["vm"] = state.get("vm", 0) + 1
-                    time.sleep(delay)
-                    continue
+
+                if verdict in ("voicemail", "screening"):
+                    if verdict == "voicemail":
+                        log_msg(f"[{email}] Screen: voicemail — hanging up", "info")
+                        hang_up(driver)
+                        with lock:
+                            state["vm"] = state.get("vm", 0) + 1
+                        time.sleep(delay)
+                        continue
+
+                    elif verdict == "screening":
+                        log_msg(f"[{email}] Screen: screener detected — waiting for silence before bypass", "info")
+                        # CRITICAL: wait for screener to fully stop talking before
+                        # playing bypass audio. Screener monologue is 4-15s.
+                        if screen_action == "play_audio" and audio_screen:
+                            ok = _wait_for_silence(driver, silence_needed_ms=_SILENCE_AFTER_AUDIO,
+                                                   timeout_s=35, label="screener-bypass ")
+                            if not ok or _dom_has(driver, _SEL_ENDED):
+                                hang_up(driver)
+                                time.sleep(delay)
+                                continue
+                            play_audio_in_tab(driver, audio_screen)
+                            # Post-screen: classify what happens after bypass plays
+                            post_verdict = _classify_post_screen(driver)
+                            log_msg(f"[{email}] Post-screen: {post_verdict} for {num}", "info")
+                            if post_verdict in ("no_answer", "voicemail"):
+                                hang_up(driver)
+                                if post_verdict == "voicemail":
+                                    with lock:
+                                        state["vm"] = state.get("vm", 0) + 1
+                                time.sleep(delay)
+                                continue
+                            # post_verdict == "human" → fall through to play initial audio
+                        elif screen_action == "hangup":
+                            hang_up(driver)
+                            time.sleep(delay)
+                            continue
 
             if dtmf_enabled and audio_initial:
                 if screen_hangup and settings.get("screen_calls_enabled"):
