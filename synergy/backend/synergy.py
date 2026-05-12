@@ -1881,6 +1881,17 @@ def api_state():
     })
 
 
+
+@flask_app.route("/api/telegram/send", methods=["POST"])
+def api_telegram_send():
+    data = request.get_json(silent=True) or {}
+    msg  = data.get("message", "").strip()
+    if not msg:
+        return jsonify({"message": "No message provided"}), 400
+    tg_notify(msg)
+    return jsonify({"message": "Sent"})
+
+
 @flask_app.route("/api/start", methods=["POST"])
 def api_start():
     if state["running"]:
@@ -2034,7 +2045,8 @@ def api_clear_cache():
 
 
 @flask_app.route("/api/login", methods=["POST"])
-def api_login():
+@flask_app.route("/api/login/<path:profile_slug>", methods=["POST"])
+def api_login(profile_slug=None):
     """FIX #56: serialize login_status writes with _login_status_lock."""
     data    = request.get_json(silent=True) or {}
     email   = data.get("email", "")
@@ -2444,7 +2456,7 @@ def run_telegram_bot():
         app.add_handler(MessageHandler(tg_filters.TEXT & ~tg_filters.COMMAND, on_plain_message))
         await app.initialize()
         await app.start()
-        await app.updater.start_polling()
+        await app.updater.start_polling(drop_pending_updates=True, allowed_updates=[])
         try:
             while True:
                 await asyncio.sleep(3600)
@@ -2452,6 +2464,28 @@ def run_telegram_bot():
             await app.updater.stop()
             await app.stop()
             await app.shutdown()
+
+    import time as _time
+
+    # Guard: only one bot thread should ever run. If token is blank, skip entirely.
+    token_check = settings.get("telegram_bot_token", "").strip()
+    if not token_check:
+        return
+
+    # Delete any existing webhook + drop pending updates before starting polling.
+    # This clears stale sessions from previous runs without needing a full restart.
+    try:
+        import urllib.request as _ur, urllib.parse as _up
+        _ur.urlopen(
+            f"https://api.telegram.org/bot{token_check}/deleteWebhook"
+            f"?drop_pending_updates=true", timeout=8
+        )
+    except Exception:
+        pass
+
+    # Small startup delay so Telegram's server expires any lingering long-poll
+    # from the previous process (Telegram enforces ~1-2s before new getUpdates).
+    _time.sleep(4)
 
     try:
         asyncio.run(main())
