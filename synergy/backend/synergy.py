@@ -1551,38 +1551,82 @@ def _wait_for_pickup_and_classify(driver):
 
 
 def classify_call(driver, classify_seconds=8):
-    """Run the energy classifier for classify_seconds and return the verdict.
-    FIX #62: Raised vm_action default to 'hangup' so the existing vm_hangup path fires.
-    Returns 'voicemail', 'human', or 'unknown'.
+    """
+    Silence-triggered classifier. Waits for the first audio silence after
+    speech starts, then classifies using firstBurstMs + DOM phrase check.
+    classify_seconds is kept as param for API compat but is now the hard timeout.
+    Returns 'voicemail', 'screening', 'human', or 'unknown'.
     """
     try:
         driver.execute_script("if(window._gvStartClassify) window._gvStartClassify();")
     except Exception:
         return "unknown"
 
-    time.sleep(classify_seconds)
+    deadline  = time.time() + max(classify_seconds, 25)
+    _last_log = 0.0
 
+    while time.time() < deadline:
+        try:
+            cs = driver.execute_script("return window._gvCallState;")
+        except Exception:
+            return "unknown"
+
+        if not cs:
+            time.sleep(0.1)
+            continue
+
+        total_ms       = cs.get("totalSpeechMs", 0)
+        consec_sil     = cs.get("consecutiveSilenceMs", 0)
+        max_burst      = cs.get("maxBurstMs", 0)
+        phrases        = cs.get("phraseCount", 0)
+        speech_started = cs.get("speechStarted", False)
+        first_burst    = cs.get("firstBurstMs", 0)
+
+        now = time.time()
+        if now - _last_log >= 2.0:
+            debug_msg(
+                f"classify: totalSpeech={total_ms}ms consecutiveSilence={consec_sil}ms "
+                f"firstBurst={first_burst}ms maxBurst={max_burst}ms phrases={phrases}"
+            )
+            _last_log = now
+
+        # VM monologue — long burst, classify immediately without waiting for silence
+        if max_burst >= _VM_MAXBURST_MS:
+            debug_msg(f"classify: voicemail (burst={max_burst}ms)")
+            return "voicemail"
+
+        # Silence-triggered: speech started and went quiet — now safe to classify
+        if speech_started and consec_sil >= _SILENCE_TO_CLASSIFY:
+            result = _classify_audio_on_silence(cs)
+            if result == "dom_fallback":
+                result = _dom_classify(driver)
+            if result in ("human", "screening"):
+                dom = _dom_classify(driver)
+                if dom == "voicemail":
+                    debug_msg(f"classify: audio={result} DOM=voicemail -> voicemail")
+                    return "voicemail"
+                if dom == "screening":
+                    result = "screening"
+            debug_msg(
+                f"classify: {result} "
+                f"(firstBurst={first_burst}ms maxBurst={max_burst}ms "
+                f"speech={total_ms}ms phrases={phrases})"
+            )
+            return result
+
+        time.sleep(0.08)
+
+    # Hard timeout fallback
     try:
-        s = driver.execute_script("return window._gvCallState;")
+        cs = driver.execute_script("return window._gvCallState;")
     except Exception:
-        return "unknown"
-
-    if not s:
-        return "unknown"
-
-    total_ms  = s.get("totalSpeechMs", 0)
-    silence   = s.get("silenceMs", 0)
-    phrases   = s.get("phraseCount", 0)
-    max_burst = s.get("maxBurstMs", 0)
-
-    debug_msg(f"classify: totalSpeech={total_ms}ms silence={silence}ms phrases={phrases} maxBurst={max_burst}ms")
-
-    if total_ms > 4000 and max_burst > 2500 and phrases <= 2:
-        return "voicemail"
-    if total_ms > 800 and phrases >= 2:
-        return "human"
-    if total_ms > 2000 and silence < 500:
-        return "voicemail"
+        cs = {}
+    if cs:
+        result = _classify_audio_on_silence(cs)
+        if result == "dom_fallback":
+            result = _dom_classify(driver)
+        debug_msg(f"classify: timeout fallback -> {result}")
+        return result
     return "unknown"
 
 
@@ -2456,7 +2500,7 @@ def run_telegram_bot():
         app.add_handler(MessageHandler(tg_filters.TEXT & ~tg_filters.COMMAND, on_plain_message))
         await app.initialize()
         await app.start()
-        await app.updater.start_polling(drop_pending_updates=True, allowed_updates=[])
+        await app.updater.start_polling(drop_pending_updates=True)
         try:
             while True:
                 await asyncio.sleep(3600)
@@ -2475,11 +2519,11 @@ def run_telegram_bot():
     # Delete any existing webhook + drop pending updates before starting polling.
     # This clears stale sessions from previous runs without needing a full restart.
     try:
-        import urllib.request as _ur, urllib.parse as _up
+        import urllib.request as _ur
         _ur.urlopen(
             f"https://api.telegram.org/bot{token_check}/deleteWebhook"
             f"?drop_pending_updates=true", timeout=8
-        )
+        ).read()
     except Exception:
         pass
 
