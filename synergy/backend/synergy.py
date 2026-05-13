@@ -1420,28 +1420,34 @@ def _classify_post_screen(driver):
     """
     Called after screener detection and bypass audio plays.
 
-    Ring tone signature (from production logs):
-      ~840ms burst (phrase 1) → 3400ms silence → ~1520ms burst (phrase 2) → 3500ms silence → ...
-      Each ring = 1 phrase. The inter-ring silence gap is always > 1500ms.
+    Real GV screen-call flow:
+      [screener detected] -> [bypass audio plays] -> [1-2s pause/silence]
+      -> [ringing again inside same call, timer keeps running]
+      -> EITHER:
+           A) Person picks up -> mic noise / "Hello?" -> human -> play p1
+           B) Screener returns -> "they can't take your call" -> voicemail
 
-    Human speech signature:
-      Short first burst (40-400ms, first syllable) → short gap (<800ms) → more phrases quickly.
-      Consecutive silence between human phrases is NEVER > 1200ms mid-sentence.
+    The ringing phase shows as near-zero audio energy in the classifier.
+    Person pickup shows as irregular short bursts (mic noise, breathing, hello).
+    Screener returning shows as same screening pattern = voicemail.
 
-    Detection strategy:
-      - If consecutiveSilenceMs > RING_GAP_MS while phrases <= RING_RESET_PHRASES → reset.
-        This fires after every ring tone, keeping the classifier clean.
-        Human speech never triggers this because inter-word gaps are < 400ms.
-      - Silence-triggered classify fires only when:
-          phrases >= 3 AND total_sp >= 500ms (a third ring fires, but by then
-          we check the reset rule first — so if it's ringing, reset wins before
-          the classify window opens after a long silence).
+    Phases:
+      1 — Wait for screener to finish after bypass (silence).
+      2 — Wait for ringing to start (energy drops to near-zero for >= 1s).
+      3 — Wait for ringing to END (energy rises = someone picked up or screener back).
+      4 — Reset classifier, classify the new audio:
+            screening result  -> voicemail (screener announcing no-answer)
+            human result      -> human (person picked up)
+            VM burst          -> voicemail
     """
     log_msg("[vm] Post-screen: waiting for screener to finish relaying message...", "info")
 
-    P1_MIN_WAIT_S = 6.0
-    P1_SILENCE_MS = 3500
-    P1_TIMEOUT_S  = 40
+    # The screener relay ("I have X calling, press 1 to accept...") takes 5-12s.
+    # A 2000ms silence threshold fires on mid-sentence pauses. Use 3500ms instead,
+    # and enforce a 6s minimum floor so we don't exit before the relay is done.
+    P1_MIN_WAIT_S   = 6.0    # screener relay is always at least 5-6s
+    P1_SILENCE_MS   = 3500   # screener won't pause 3.5s mid-sentence
+    P1_TIMEOUT_S    = 40
 
     p1_floor_start = time.time()
     while time.time() - p1_floor_start < P1_MIN_WAIT_S:
@@ -1457,65 +1463,131 @@ def _classify_post_screen(driver):
     if _dom_has(driver, _SEL_ENDED):
         return "no_answer"
 
-    log_msg("[vm] Post-screen: screener done — starting classify...", "info")
+    log_msg("[vm] Post-screen: screener fully silent — waiting for next voice event...", "info")
 
+    # ── Phase 2+3: Ring-tone gate → silence-triggered classifier ───────────────
+    # Ring-tone gate: each reset window checks if the burst is real voice or ring.
+    #   Real voice clears the gate → hand off to silence-triggered classifier
+    #   (same logic as _wait_for_pickup_and_classify, works reliably for humans).
+    # Ring tone patterns (from logs):
+    #   Single-pulse: 1 phrase, any burst length, drops after ~500-800ms
+    #   Double-pulse:  2 phrases, totalSpeechMs < 600ms (two tiny pops)
+    # Gate clears on: phrases>=3 OR (phrases>=2 AND totalSpeechMs>=600ms)
+
+    CALL_ELAPSED_LIMIT = 62.0
+    CONFIRM_WINDOW_S   = 4.5
     connected_at = getattr(driver, "_call_connected_at", None) or time.time()
 
-    # 1.5s pause: let any in-progress ring cycle complete before we reset.
     time.sleep(1.5)
     _reset_classify(driver)
-    time.sleep(0.2)
+    time.sleep(0.3)
 
-    RESPONSE_TIMEOUT   = 55.0
-    CALL_ELAPSED_LIMIT = 62.0
-    classify_start     = time.time()
-    last_log           = 0.0
-    log_every          = 2.0
+    last_ring_log     = 0.0
+    first_speech_time = None
+    passed_gate       = False
 
-    # Ring-tone detector: if inter-phrase silence > this threshold, it's a ring gap → reset.
-    # US ring cadence = ~2s on, ~4s off. Human inter-word silence is < 800ms.
-    RING_GAP_MS          = 1200   # silence longer than this between early phrases = ring
-    RING_RESET_PHRASES   = 3      # only apply ring reset when phrases are still low
+    log_msg("[vm] Post-screen: listening for pickup or VM greeting...", "info")
+    while not passed_gate:
+        if _dom_has(driver, _SEL_ENDED):
+            log_msg("[vm] Post-screen: call ended while waiting for pickup", "info")
+            return "no_answer"
 
-    # DOM scan: screener relay text stays in DOM for ~10s — ignore until cleared
-    DOM_SCAN_DELAY     = 10.0
-    dom_check_interval = 1.0
-    last_dom_check     = 0.0
+        elapsed_total = time.time() - connected_at
+        if elapsed_total >= CALL_ELAPSED_LIMIT:
+            log_msg(f"[vm] Post-screen: call limit reached ({elapsed_total:.0f}s) -> no_answer", "info")
+            return "no_answer"
 
+        cs = _get_call_state(driver)
+        if cs and cs.get("speechStarted", False):
+            total_sp   = cs.get("totalSpeechMs", 0)
+            phrases    = cs.get("phraseCount", 0)
+            max_burst  = cs.get("maxBurstMs", 0)
+
+            now = time.time()
+            if first_speech_time is None:
+                first_speech_time = now
+                debug_msg(
+                    f"[vm] Post-screen: speech candidate "
+                    f"({total_sp}ms/{phrases}ph maxBurst={max_burst}ms) — accumulating..."
+                )
+
+            time_since_first = now - first_speech_time
+
+            if phrases >= 3:
+                passed_gate = True
+                log_msg(f"[vm] Post-screen: gate passed (tier1: {phrases}ph) at {elapsed_total:.0f}s", "info")
+            elif phrases >= 2 and total_sp >= 400:
+                passed_gate = True
+                log_msg(f"[vm] Post-screen: gate passed (tier2: {phrases}ph/{total_sp}ms) at {elapsed_total:.0f}s", "info")
+            elif time_since_first >= CONFIRM_WINDOW_S:
+                debug_msg(
+                    f"[vm] Post-screen: ring tone rejected "
+                    f"({total_sp}ms/{phrases}ph maxBurst={max_burst}ms "
+                    f"after {time_since_first:.1f}s) — resetting"
+                )
+                _reset_classify(driver)
+                first_speech_time = None
+                time.sleep(0.1)
+
+        elif first_speech_time is not None:
+            debug_msg("[vm] Post-screen: burst ended below threshold — ring tone, resetting")
+            _reset_classify(driver)
+            first_speech_time = None
+
+        if not passed_gate:
+            now = time.time()
+            if now - last_ring_log >= 5.0:
+                log_msg(f"[vm] Post-screen: still waiting ({elapsed_total:.0f}s / {CALL_ELAPSED_LIMIT:.0f}s)...", "info")
+                last_ring_log = now
+            time.sleep(0.08)
+
+    # Gate cleared — hand off to silence-triggered classifier (same as non-screening path).
+    # Do NOT reset here — keep the accumulated speech so the classifier has full context.
+    log_msg("[vm] Post-screen: gate cleared — running silence-triggered classify...", "info")
+
+    RESPONSE_TIMEOUT = 60.0
+    log_every = 5.0
+    classify_start = time.time()
+    last_log = 0.0
+
+    # ── Classify the pickup audio ────────────────────────────────────────────
+    dom_check_interval = 1.0   # check DOM for VM keywords every 1s
+    last_dom_check = 0.0
+    # DOM_SCAN_DELAY: don't check DOM until this many seconds have elapsed.
+    # Screener relay text stays in the DOM for several seconds after silence —
+    # phrases like "not available" / "take your call" appear in the relay and
+    # would false-positive the VM keyword scan. Wait 10s for DOM to clear.
+    DOM_SCAN_DELAY = 10.0
     while True:
         if _dom_has(driver, _SEL_ENDED):
             log_msg("[vm] Post-screen: call ended during classify", "info")
             return "no_answer"
 
-        elapsed       = time.time() - classify_start
-        elapsed_total = time.time() - connected_at
-
-        if elapsed_total >= CALL_ELAPSED_LIMIT:
-            log_msg(f"[vm] Post-screen: call limit ({elapsed_total:.0f}s) — no_answer", "info")
-            return "no_answer"
-
+        elapsed = time.time() - classify_start
         cs = _get_call_state(driver)
 
-        # DOM VM keyword scan — only after relay text clears
+        # Continuous DOM scan — only after stale screener text has cleared.
+        # GV renders VM transcript text as the greeting plays (~10s+ after silence).
         now_dom = time.time()
         if elapsed >= DOM_SCAN_DELAY and now_dom - last_dom_check >= dom_check_interval:
             dom_verdict = _dom_classify(driver, check_screen=False)
             if dom_verdict == "voicemail":
-                log_msg("[vm] Post-screen: VM keyword in DOM -> voicemail", "info")
+                log_msg("[vm] Post-screen: VM keyword detected in DOM -> voicemail", "info")
                 return "voicemail"
             last_dom_check = now_dom
 
         now = time.time()
-        if now - last_log >= log_every and cs:
-            debug_msg(
-                f"[vm] Post-screen classify: "
-                f"speech={cs.get('totalSpeechMs',0)}ms "
-                f"firstBurst={cs.get('firstBurstMs',0)}ms "
-                f"maxBurst={cs.get('maxBurstMs',0)}ms "
-                f"phrases={cs.get('phraseCount',0)} "
-                f"consec_sil={cs.get('consecutiveSilenceMs',0)}ms "
-                f"elapsed={elapsed:.1f}s"
-            )
+        if now - last_log >= log_every:
+            if cs:
+                log_msg(
+                    f"[vm] Post-screen classifying: "
+                    f"speech={cs.get('totalSpeechMs',0)}ms "
+                    f"firstBurst={cs.get('firstBurstMs',0)}ms "
+                    f"maxBurst={cs.get('maxBurstMs',0)}ms "
+                    f"phrases={cs.get('phraseCount',0)} "
+                    f"elapsed={elapsed:.1f}s",
+                    "info"
+                )
             last_log = now
 
         if cs:
@@ -1526,47 +1598,66 @@ def _classify_post_screen(driver):
             phrases     = cs.get("phraseCount", 0)
             first_burst = cs.get("firstBurstMs", 0)
 
-            # VM monologue: one single very long burst
+            # VM monologue burst
             if max_burst >= _VM_MAXBURST_MS:
-                log_msg(f"[vm] Post-screen: VM burst ({max_burst}ms) -> voicemail", "info")
+                log_msg(f"[vm] Post-screen: voicemail burst ({max_burst}ms)", "info")
                 return "voicemail"
 
-            # ── Ring-tone gate ────────────────────────────────────────────────
-            # Ring inter-phrase gap is 3-4s. Human inter-word gap is <800ms.
-            # If we see a long silence while phrase count is still low, reset —
-            # it's the pause between ring tones, not a human pausing mid-sentence.
-            if speech and phrases <= RING_RESET_PHRASES and consec_sil >= RING_GAP_MS:
-                debug_msg(
-                    f"[vm] Post-screen: ring gap detected "
-                    f"(phrases={phrases} consec_sil={consec_sil}ms) — resetting"
+            # Silence-triggered classification
+            # Post-screen needs more evidence than normal classify:
+            #   - min 400ms total speech (filters ring tone bleed)
+            #   - min 2 phrases (1 phrase = could be VM starting, not enough signal)
+            #   - OR if phrases=1 but firstBurst>900ms = screener/VM pattern
+            # Never use DOM fallback — DOM is stale from original screener detection.
+            enough_evidence = (
+                total_sp >= 400 and (
+                    phrases >= 2 or first_burst > _HUMAN_FIRST_BURST_MS
                 )
-                time.sleep(0.5)  # wait for silence to fully settle before reset
-                _reset_classify(driver)
-                time.sleep(0.2)
-                continue
-
-            # ── Silence-triggered classify ────────────────────────────────────
-            # Requires: speech started, phrases >= 2, total >= 300ms, silence hit.
-            # The ring gate above ensures any ring with phrases <= 3 gets reset
-            # before silence-triggered classify can fire after the ring gap.
-            enough_evidence = phrases >= 2 and total_sp >= 300
-            if speech and enough_evidence and consec_sil >= _SILENCE_TO_CLASSIFY:
+            )
+            # Post-screen reacts after 600ms silence (not 1800ms) for faster response
+            _POST_SCREEN_SILENCE = 600
+            if speech and enough_evidence and consec_sil >= _POST_SCREEN_SILENCE:
                 result = _classify_audio_on_silence(cs)
                 if result == "dom_fallback":
-                    continue
+                    continue  # not enough signal yet — keep waiting silently
 
+                # Post-screen verdict logic:
+                # - "voicemail"  → VM greeting confirmed by audio → voicemail
+                # - "screening"  → check DOM first; screener returning to say
+                #                  "no one available" uses same audio pattern as
+                #                  human conversation. DOM is the only reliable
+                #                  differentiator here.
+                # - "human"      → DOM check as safety net, then play p1
+                #
+                # DOM check is only reliable once screener relay text has cleared
+                # (10s+ after post-screen classify starts, tracked via elapsed).
                 if result == "voicemail":
                     log_msg("[vm] Post-screen: audio=voicemail -> voicemail", "info")
                     return "voicemail"
 
                 if result == "screening":
+                    # At 38s+ total call time the screener is returning to say
+                    # "they're unavailable" — trust the screening verdict directly.
+                    # The original classifier is accurate here; DOM is unreliable
+                    # because relay text has cleared by this point.
+                    # Before 38s, a human pickup whose speech looks like screening
+                    # pattern is possible — fall through to DOM check.
                     elapsed_total_now = time.time() - connected_at
-                    if elapsed_total_now > 46.0:
+                    # Human voice has long bursts — screener TTS stays under 800ms.
+                    # If we see maxBurst>=1500ms or totalSpeech>=2500ms, force human.
+                    if max_burst >= 1500 or total_sp >= 2500:
+                        log_msg(
+                            f"[vm] Post-screen: screening label but maxBurst={max_burst}ms "
+                            f"totalSpeech={total_sp}ms — human voice energy -> human", "info"
+                        )
+                        result = "human"
+                    elif elapsed_total_now >= 46.0:
                         log_msg(
                             f"[vm] Post-screen: screening at {elapsed_total_now:.0f}s "
                             f"-> screener returned unavailable -> voicemail", "info"
                         )
                         return "voicemail"
+                    # Early screening result — use DOM to confirm
                     dom = _dom_classify(driver)
                     if dom == "voicemail":
                         log_msg("[vm] Post-screen: screening+DOM=voicemail -> voicemail", "info")
@@ -1575,18 +1666,19 @@ def _classify_post_screen(driver):
                     result = "human"
 
                 if result == "human":
+                    # Final DOM safety check
                     dom = _dom_classify(driver)
                     if dom == "voicemail":
                         log_msg("[vm] Post-screen: audio=human DOM=voicemail -> voicemail", "info")
                         return "voicemail"
-                    log_msg(
-                        f"[vm] Post-screen result: human "
-                        f"(speech={total_sp}ms firstBurst={first_burst}ms "
-                        f"burst={max_burst}ms phrases={phrases} "
-                        f"elapsed={elapsed*1000:.0f}ms)",
-                        "info"
-                    )
-                    return result
+
+                log_msg(
+                    f"[vm] Post-screen result: {result} "
+                    f"(speech={total_sp}ms firstBurst={first_burst}ms "
+                    f"burst={max_burst}ms phrases={phrases} elapsed={elapsed*1000:.0f}ms)",
+                    "info"
+                )
+                return result
 
         if elapsed >= RESPONSE_TIMEOUT:
             dom = _dom_classify(driver)
@@ -1594,6 +1686,7 @@ def _classify_post_screen(driver):
             return dom if dom != "human" else "no_answer"
 
         time.sleep(0.08)
+
 
 def _wait_for_pickup_and_classify(driver):
     """
